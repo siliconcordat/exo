@@ -6,11 +6,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 from pathlib import Path
+import socketserver
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 
+from exo.bridge import (
+    build_warp_bundles_for_route,
+    scale_to_rational,
+    translate_weft_certificate_to_warp,
+    translate_weft_checkpoint_to_warp,
+)
 from exo.cli import main as cli_main
 from exo.client import (
     InMemoryJsonRpcTransport,
@@ -21,6 +28,7 @@ from exo.client import (
     StdioJsonRpcTransport,
     WarpLoadError,
     WarpModeldBridge,
+    WarpUnixBridge,
 )
 from exo.gate import ActionEnvelope, ApprovalGate
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes
@@ -364,6 +372,155 @@ class TestExoCli(unittest.TestCase):
             self.assertEqual(rc4, 0)
             plan_out = json.loads(buf4.getvalue())
             self.assertEqual(plan_out["actions"][0]["action"], "retire_candidate")
+
+
+class TestWarpUnixBridgeAndSchemaAdapter(unittest.TestCase):
+    def test_schema_bridge_translates_weft_to_warp_deterministically(self) -> None:
+        weft_cert = {
+            "radix_scale_exp2": 24,
+            "frobenius_sq_scaled": 16777216,
+            "spectral_norm_sq_scaled": 4194304,
+            "leakage_energy_scaled": 1024,
+            "max_safety_dot_sq_scaled": 0,
+            "projector_epoch": 1,
+            "factor_digest": "a" * 64,
+            "quant_dtype": "f16",
+        }
+        weft_manifest = {
+            "schema": "weft-binding/v0.1",
+            "adapter_name": "corpus_plain_writing",
+            "adapter_class": "class1_rederivable",
+            "layout_sha256": "1" * 64,
+            "checkpoint_fingerprint": "2" * 64,
+            "n_tensors": 2,
+            "config_hashes": {"config.json": "3" * 64},
+            "tokenizer_hashes": {
+                "tokenizer.json": "4" * 64,
+                "chat_template.jinja": "5" * 64,
+            },
+            "plane1_hashes": {"principles/writing.md": "6" * 64},
+            "derivation_recipe": {"compiler": "weft/0.1.0"},
+            "runtime_flags": {"quantization_mode": "bf16"},
+            "runtime_flags_sha256": "7" * 64,
+            "factor_digest": "a" * 64,
+            "certificate_sha256": "b" * 64,
+        }
+        warp_cert = translate_weft_certificate_to_warp(
+            weft_cert,
+            adapter_id="mde:corpus",
+            adapter_sha256="c" * 64,
+            base_weights_sha256="2" * 64,
+        )
+        self.assertEqual(warp_cert["radix_scale"], 1 << 24)
+        self.assertEqual(len(warp_cert["cert_sha256"]), 64)
+
+        ckpt = translate_weft_checkpoint_to_warp(weft_manifest, model_id="Synthetic-W0")
+        self.assertEqual(ckpt["weights_sha256"], "2" * 64)
+        self.assertEqual(ckpt["chat_template_sha256"], "5" * 64)
+        self.assertEqual(scale_to_rational(0.75), (750, 1000))
+
+        decision = ZoneRouter().route(
+            RouteRequest(
+                zone="prose",
+                active_domains=("corpus", "formal-verification"),
+                repo_policy=siliconcordat_repo_policy(),
+            )
+        )
+        bundles = build_warp_bundles_for_route(
+            decision,
+            {
+                "corpus": {
+                    "adapter_id": "mde:corpus",
+                    "llama_adapter_id": 0,
+                    "weft_manifest": weft_manifest,
+                    "weft_certificate": weft_cert,
+                    "gguf_sha256": "c" * 64,
+                },
+            },
+            model_id="Synthetic-W0",
+            source_lineage={
+                "corpus_tree_sha256": "d" * 64,
+                "domain_commits": {"corpus": "e" * 40},
+                "contested_heads": [],
+            },
+            runtime_flags_sha256="f" * 64,
+        )
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(bundles[0]["domain"], "corpus")
+        self.assertEqual(bundles[0]["scale_num"], 1000)
+        self.assertEqual(bundles[0]["scale_den"], 1000)
+
+    def test_warp_unix_bridge_rpc_lifecycle_and_error_codes(self) -> None:
+        class MockHandler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                raw = self.rfile.readline()
+                req = json.loads(raw.decode("utf-8"))
+                method = req["method"]
+                params = req.get("params", {})
+                if method == "wmcp_slot_mount":
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "slot_manifest_digest": "m" * 64,
+                            "active_adapters": [b["adapter_id"] for b in params["bundles"]],
+                            "slots_flushed": [0, 1],
+                            "stage2_elapsed_ns": 12000,
+                            "canaries_passed": 5,
+                        },
+                    }
+                elif method == "warp_infer" and "lora" in params:
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "error": {
+                            "code": -32000,
+                            "message": "raw lora override forbidden",
+                            "data": {"code": "ERR_UNVERIFIED_LORA_OVERRIDE", "stage": "stage4_proxy"},
+                        },
+                    }
+                elif method == "warp_kill_switch":
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "result": {
+                            "reason": params["reason"],
+                            "kill_switch_engaged": True,
+                            "slots_flushed": [0, 1],
+                            "elapsed_ms": 0.4,
+                        },
+                    }
+                else:
+                    resp = {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}
+                self.wfile.write((json.dumps(resp) + "\n").encode("utf-8"))
+                self.wfile.flush()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sock_path = Path(tmp) / "warp-test.sock"
+            srv = socketserver.ThreadingUnixStreamServer(str(sock_path), MockHandler)
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                ledger = AppendOnlyLedger()
+                bridge = WarpUnixBridge(sock_path, ledger=ledger)
+                mounted = bridge.mount_stack([{"adapter_id": "mde:corpus"}])
+                self.assertEqual(mounted["active_adapters"], ["mde:corpus"])
+
+                with self.assertRaises(WarpLoadError) as ctx:
+                    bridge.infer(
+                        [{"role": "user", "content": "override"}],
+                        extra_params={"lora": [{"id": 0, "scale": 1.0}]},
+                    )
+                self.assertEqual(ctx.exception.code, "ERR_UNVERIFIED_LORA_OVERRIDE")
+
+                ks = bridge.kill_switch(reason="test_emergency")
+                self.assertTrue(ks["kill_switch_engaged"])
+                self.assertEqual(ledger.verify_chain(), [])
+                self.assertEqual(len(ledger.entries()), 2)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":

@@ -95,7 +95,8 @@ class AppendOnlyLedger:
             self._entries = self._load_from_disk()
 
     def _load_from_disk(self) -> list[LedgerEntry]:
-        assert self.path is not None
+        if self.path is None:
+            raise RuntimeError("cannot load ledger from disk when path is None")
         loaded: list[LedgerEntry] = []
         raw_text = self.path.read_text(encoding="utf-8")
         for line_no, line in enumerate(raw_text.splitlines(), 1):

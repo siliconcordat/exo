@@ -1,5 +1,12 @@
 """Layer 4 Exo harness core package (stdlib-only)."""
 
+from exo.bridge import (
+    build_warp_adapter_bundle,
+    build_warp_bundles_for_route,
+    scale_to_rational,
+    translate_weft_certificate_to_warp,
+    translate_weft_checkpoint_to_warp,
+)
 from exo.capabilities import AdaptationProposal, CapabilityCharter, CapabilityRegistry, PeerResponse
 from exo.client import (
     InMemoryJsonRpcTransport,
@@ -9,6 +16,7 @@ from exo.client import (
     StdioJsonRpcTransport,
     WarpLoadError,
     WarpModeldBridge,
+    WarpUnixBridge,
 )
 from exo.gate import (
     ActionEnvelope,
@@ -63,16 +71,22 @@ __all__ = [
     "UpgradePlan",
     "WarpLoadError",
     "WarpModeldBridge",
+    "WarpUnixBridge",
     "ZoneConstraints",
     "ZoneRouter",
+    "build_warp_adapter_bundle",
+    "build_warp_bundles_for_route",
     "canonical_json_bytes",
     "corpus_repo_policy",
     "decode_git_path",
     "foundation0_repo_policy",
     "normalize_repo_path",
     "proven_commons_repo_policy",
+    "scale_to_rational",
     "sha256_hex",
     "siliconcordat_repo_policy",
+    "translate_weft_certificate_to_warp",
+    "translate_weft_checkpoint_to_warp",
     "unwrap_command_argv",
     "validate_change_against_policy",
     "weft_eido_repo_policy",

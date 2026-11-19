@@ -125,7 +125,8 @@ class SIMMemory:
             self._replay_disk()
 
     def _replay_disk(self) -> None:
-        assert self.path is not None
+        if self.path is None:
+            raise RuntimeError("cannot load SIM journal from disk when path is None")
         for line_no, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue

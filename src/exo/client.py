@@ -1,9 +1,11 @@
-"""L5 siliconcordat/mde MCP client and L3 warp-modeld HTTP bridge."""
+"""L5 siliconcordat/mde MCP client and L3 warp-modeld HTTP/Unix-socket bridges."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
+import socket
 import subprocess
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 import urllib.error
@@ -20,9 +22,31 @@ MDE_META_KEY = "gg.siliconcordat/mde"
 class MdeProtocolError(Exception):
     """Raised when L5 MCP protocol preconditions or JSON-RPC calls fail."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        detail: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
+
 
 class WarpLoadError(Exception):
     """Raised when L3 warp-modeld rejects, mismatches, or rolls back an adapter mount."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        data: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
 
 
 class JsonRpcTransport(Protocol):
@@ -64,7 +88,8 @@ class StdioJsonRpcTransport:
     def send(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if self._proc.poll() is not None:
             raise MdeProtocolError(f"stdio MCP process exited with code {self._proc.returncode}")
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        if self._proc.stdin is None or self._proc.stdout is None:
+            raise MdeProtocolError("stdio MCP process pipes are unavailable")
         line = canonical_json_bytes(request).decode("ascii") + "\n"
         self._proc.stdin.write(line)
         self._proc.stdin.flush()
@@ -152,7 +177,12 @@ class MdeClient:
             raise MdeProtocolError(f"{tool_name} returned non-object result")
         if result.get("isError") is True:
             detail = result.get("structuredContent") or result.get("content") or result
-            raise MdeProtocolError(f"{tool_name} refused (isError=true): {detail}")
+            code = detail.get("code") if isinstance(detail, dict) else None
+            raise MdeProtocolError(
+                f"{tool_name} refused (isError=true): {detail}",
+                code=str(code) if code is not None else None,
+                detail=detail,
+            )
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
             return structured
@@ -249,6 +279,13 @@ class MdeClient:
             "edits": list(edits),
             "allow_oracle_write": bool(allow_oracle_write),
         }
+        if seam_contract is not None and {
+            "exported_symbols_touched",
+            "calls_added",
+            "unresolved_dynamic_sites",
+            "declared_effects",
+        }.issubset(seam_contract.keys()):
+            args["seam_contract"] = dict(seam_contract)
         if commit_subject is not None:
             args["commit_subject"] = commit_subject
         if summary_lines is not None:
@@ -426,3 +463,164 @@ class WarpModeldBridge:
                 },
             )
         return receipt
+
+
+class WarpUnixBridge:
+    """Pure-stdlib Unix domain socket JSON-RPC 2.0 client for live L3 warp-modeld.
+
+    Speaks the newline-delimited JSON-RPC 2.0 protocol implemented by
+    siliconcordat/warp's WarpUnixRpcServer (`wmcp_checkpoint_identify`,
+    `wmcp_slot_status`, `wmcp_slot_mount`, `wmcp_slot_unmount`,
+    `warp_kill_switch`, `warp_reset_kill_switch`, `warp_update_lineage`,
+    `warp_infer`).
+    """
+
+    def __init__(
+        self,
+        socket_path: str | Path,
+        *,
+        ledger: Optional[AppendOnlyLedger] = None,
+        timeout_sec: float = 10.0,
+        actor_id: str = "exo-warp-unix-bridge",
+    ) -> None:
+        self.socket_path = str(socket_path)
+        self.ledger = ledger
+        self.timeout_sec = float(timeout_sec)
+        self.actor_id = actor_id
+        self._req_id = 0
+
+    def _rpc(self, method: str, params: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        self._req_id += 1
+        request = {
+            "jsonrpc": "2.0",
+            "id": self._req_id,
+            "method": method,
+            "params": dict(params or {}),
+        }
+        wire = canonical_json_bytes(request) + b"\n"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout_sec)
+                sock.connect(self.socket_path)
+                sock.sendall(wire)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if b"\n" in chunk:
+                        break
+        except OSError as exc:
+            raise WarpLoadError(f"warp-modeld unix socket call '{method}' failed: {exc}") from exc
+
+        raw = b"".join(chunks).splitlines()
+        if not raw:
+            raise WarpLoadError(f"warp-modeld closed socket without reply for '{method}'")
+        try:
+            response = json.loads(raw[0].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WarpLoadError(f"warp-modeld returned invalid JSON for '{method}': {exc}") from exc
+
+        if not isinstance(response, dict):
+            raise WarpLoadError(f"warp-modeld returned non-object JSON-RPC payload for '{method}'")
+        if "error" in response and response["error"] is not None:
+            err = response["error"]
+            data = err.get("data") if isinstance(err, dict) else None
+            code = data.get("code") if isinstance(data, dict) else None
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise WarpLoadError(
+                f"warp-modeld '{method}' rejected ({code or 'RPC_ERROR'}): {msg}",
+                code=str(code) if code is not None else None,
+                data=dict(data) if isinstance(data, dict) else None,
+            )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise WarpLoadError(f"warp-modeld returned non-object result for '{method}'")
+        return result
+
+    def identify_checkpoint(self) -> dict[str, Any]:
+        return self._rpc("wmcp_checkpoint_identify")
+
+    def slot_status(self) -> dict[str, Any]:
+        return self._rpc("wmcp_slot_status")
+
+    def mount_stack(
+        self,
+        bundles: Sequence[Mapping[str, Any]],
+        *,
+        composed_certificate: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"bundles": [dict(b) for b in bundles]}
+        if composed_certificate is not None:
+            params["composed_certificate"] = dict(composed_certificate)
+        result = self._rpc("wmcp_slot_mount", params)
+        if self.ledger is not None:
+            self.ledger.append(
+                "warp_unix_mount",
+                self.actor_id,
+                {
+                    "slot_manifest_digest": result.get("slot_manifest_digest"),
+                    "active_adapters": result.get("active_adapters"),
+                    "slots_flushed": result.get("slots_flushed"),
+                    "stage2_elapsed_ns": result.get("stage2_elapsed_ns"),
+                    "canaries_passed": result.get("canaries_passed"),
+                },
+            )
+        return result
+
+    def unmount(self, *, reason: str = "exo_unmount") -> dict[str, Any]:
+        result = self._rpc("wmcp_slot_unmount", {"reason": reason})
+        if self.ledger is not None:
+            self.ledger.append(
+                "warp_unix_unmount",
+                self.actor_id,
+                {"reason": reason, "slots_flushed": result.get("slots_flushed")},
+            )
+        return result
+
+    def kill_switch(self, *, reason: str = "exo_kill_switch") -> dict[str, Any]:
+        result = self._rpc("warp_kill_switch", {"reason": reason})
+        if self.ledger is not None:
+            self.ledger.append(
+                "warp_unix_kill_switch",
+                self.actor_id,
+                {
+                    "reason": reason,
+                    "kill_switch_engaged": result.get("kill_switch_engaged"),
+                    "slots_flushed": result.get("slots_flushed"),
+                    "elapsed_ms": result.get("elapsed_ms"),
+                },
+            )
+        return result
+
+    def reset_kill_switch(self, confirmation: str) -> dict[str, Any]:
+        result = self._rpc("warp_reset_kill_switch", {"confirmation": confirmation})
+        if self.ledger is not None:
+            self.ledger.append("warp_unix_kill_switch_reset", self.actor_id, {"status": result})
+        return result
+
+    def update_lineage(self, lineage: Mapping[str, Any]) -> dict[str, Any]:
+        result = self._rpc("warp_update_lineage", {"lineage": dict(lineage)})
+        if self.ledger is not None:
+            self.ledger.append("warp_unix_lineage_update", self.actor_id, {"status": result.get("status")})
+        return result
+
+    def infer(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        temperature: float = 0.0,
+        seed: int = 42,
+        max_tokens: int = 256,
+        extra_params: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "messages": [dict(m) for m in messages],
+            "temperature": float(temperature),
+            "seed": int(seed),
+            "max_tokens": int(max_tokens),
+        }
+        if extra_params:
+            params.update(extra_params)
+        return self._rpc("warp_infer", params)

@@ -190,11 +190,15 @@ WRAPPER_BOOL_FLAGS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
 
 DEFAULT_PROTECTED_PATH_PATTERNS = (
     r"(^|/)auth(/|$|\.)",
+    r"(^|/)security(/|$|\.)",
     r"(^|/)credentials?(/|$|\.)",
     r"(^|/)secrets?(/|$|\.)",
     r"(^|/)\.env(\.|$)",
     r"(^|/)schemas?(/|$|\.)",
     r"\.schema\.json$",
+    r"(^|/)migrations(/|$)",
+    r"(^|/)infra(/|$)",
+    r"(^|/)\.github(/|$)",
     r"(^|/)tests?(/|$)",
     r"(^|/)oracles?(/|$)",
     r"(^|/)anchors?(/|$)",

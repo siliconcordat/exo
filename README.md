@@ -22,7 +22,8 @@ Exo is written for people and teams running multi-agent workflows over self-host
 - `src/exo/sim.py`: Append-only Self-Improvement Memory (`SIMMemory`) and `CrossGenerationPlanner` classifying rules across base model upgrades into `recompile`, `retire_candidate`, or `escalate_human`.
 - `src/exo/policy.py`: Declarative per-repository Layer 2 policy manifests (`RepoPolicy`) enforcing merge strategy, commit trailers (DCO versus none), CI status, and locked-checker separation strictly outside model weights.
 - `src/exo/router.py`: Dynamic zone-scoped multi-MDE router (`ZoneRouter`) mapping syntactic zones (`prose`, `code`, `formal_proof`, `ui_module`, `condensed_json`, `research_page`, `html_report`) across `corpus`, `weft-eido`, and `formal-verification`, enforcing `data-eido-skip` and raising `ContestedPreferenceError` under Hard Veto 2.
-- `src/exo/client.py`: L5 `mde` JSON-RPC 2.0 client (`MdeClient`, in-memory and stdio subprocess transports) enforcing session `read_tokens` before `splice_patch`, plus L3 `warp-modeld` HTTP bridge (`WarpModeldBridge`) verifying load receipts and triggering `O(1)` rollback with KV and recurrent-state flush on drift.
+- `src/exo/client.py`: L5 `mde` JSON-RPC 2.0 client (`MdeClient`, in-memory and stdio subprocess transports) enforcing session `read_tokens` before `splice_patch`, plus L3 `warp-modeld` HTTP (`WarpModeldBridge`) and Unix domain socket JSON-RPC 2.0 (`WarpUnixBridge`) bridges verifying load receipts and triggering `O(1)` rollback with KV and recurrent-state flush on drift.
+- `src/exo/bridge.py`: Pure-stdlib cross-layer schema translator converting L2 `weft` certificates, manifests, and L4 `RouteDecision` scale vectors into L3 `warp-modeld` `AdapterBundle` payloads without adding runtime dependencies.
 - `src/exo/cli.py`: Command-line utility (`python3 -m exo`) for `verify-ledger`, `route-zone`, `check-policy`, and `plan-upgrade`.
 
 ## Run tests and CLI
@@ -42,9 +43,10 @@ PYTHONPATH=src python3 -m exo check-policy --preset weft-eido --message "Fix lay
 
 ## Status and verification boundary
 
-Step 2 kernel and unit/integration tests are implemented and pass locally against in-memory, stdio subprocess, and localhost HTTP mocks. Live end-to-end runs against the Rust `siliconcordat/mde` binary, live `siliconcordat/warp` `warp-modeld`, and real multi-MDE open-weights checkpoints belong to Phases 2 and 3 in [PLAN.md](PLAN.md) and are not claimed here.
+The core stdlib kernel and offline test suite (31 tests) pass with zero external dependencies, and `tests/test_vertical_stack.py` plus `examples/vertical_splice_demo.py` pass live end-to-end against compiled Rust `siliconcordat/mde`, `siliconcordat/weft` on synthetic Safetensors checkpoints, and `siliconcordat/warp` `warp-modeld` over Unix domain socket against `MockLlamaServer`. Live runs on 8B or 27B open-weights GPU checkpoints belong to Phase 3 in [PLAN.md](PLAN.md) and are not claimed here.
 
 ## Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): Trust firewall, core module contracts, interference matrix, and Hard Vetoes compliance.
+- [docs/VERTICAL-INTEGRATION.md](docs/VERTICAL-INTEGRATION.md): Four-layer live vertical integration commands, measured results, and cross-layer schema findings.
 - [LICENSE](LICENSE): Apache License 2.0 for code. Documentation is licensed under CC BY 4.0.
