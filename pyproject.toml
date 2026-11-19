@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siliconcordat-exo"
+version = "0.1.0"
+description = "L4 agent harness: append-only memory, exact-byte approval gates, SIM causal memory, and zone-scoped multi-MDE routing."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+exo = "exo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
