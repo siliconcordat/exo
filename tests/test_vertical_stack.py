@@ -8,9 +8,13 @@ the suite skips cleanly so standalone zero-dependency `exo` tests stay green.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import unittest
+
+from exo.policy import foundation0_repo_policy, weft_eido_repo_policy
+from exo.router import RouteRequest, ZoneRouter
 
 _DEMO_PATH = Path(__file__).resolve().parent.parent / "examples" / "vertical_splice_demo.py"
 _SPEC = importlib.util.spec_from_file_location("_exo_vertical_splice_demo", str(_DEMO_PATH))
@@ -127,6 +131,43 @@ class TestVerticalFourLayerStack(unittest.TestCase):
         self.assertEqual([a["adapter_id"] for a in s5["w_new_active_adapters"]], ["mde:corpus"])
         self.assertIn("[ACTIVE_LORA:0]", s5["w_new_infer_text"])
         self.assertEqual(s5["warp_new_ledger_receipts_verified"], 2)  # 1 stale reject + 1 fresh mount
+
+    def test_live_l5_zone_manifest_verifies_and_compiles_router(self) -> None:
+        if _SIBLING_ENV is None:
+            self.skipTest("sibling env unavailable")
+        raw_manifest = os.environ.get("MDE_MANIFEST")
+        if raw_manifest:
+            manifest_path = Path(raw_manifest)
+        else:
+            # Standard Cargo target layout: <mde_root>/target/{debug,release}/mde
+            manifest_path = _SIBLING_ENV.mde_bin.parents[2] / "schemas" / "zone-manifest.v0.1.json"
+        if not manifest_path.is_file():
+            self.skipTest("mde schemas/zone-manifest.v0.1.json not found alongside MDE_BIN")
+
+        router = ZoneRouter.from_zone_manifest_file(manifest_path)
+        self.assertIsNotNone(router.manifest_id)
+        self.assertTrue((router.manifest_id or "").startswith("sha256:"))
+
+        fp = router.route(
+            RouteRequest(
+                zone="formal_proof",
+                active_domains=("corpus", "weft-eido", "formal-verification"),
+                repo_policy=foundation0_repo_policy(),
+            )
+        )
+        self.assertEqual(fp.l1_bank_tag, 3)
+        self.assertEqual(fp.scale_map(), {"corpus": 0.0, "weft-eido": 0.0, "formal-verification": 1.0})
+        self.assertTrue(fp.constraints.enforce_data_eido_skip)
+
+        ui = router.route(
+            RouteRequest(
+                zone="ui_module",
+                active_domains=("corpus", "weft-eido", "formal-verification"),
+                repo_policy=weft_eido_repo_policy(),
+            )
+        )
+        self.assertEqual(ui.l1_bank_tag, 2)
+        self.assertEqual(ui.scale_map(), {"corpus": 0.2, "weft-eido": 1.0, "formal-verification": 0.0})
 
 
 if __name__ == "__main__":

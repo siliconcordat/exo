@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from exo.ledger import AppendOnlyLedger, canonical_json_bytes, utc_now_iso
+from exo.ledger import (
+    AppendOnlyLedger,
+    canonical_json_bytes,
+    redact_secrets_in_text,
+    redact_secrets_in_value,
+    utc_now_iso,
+)
 
 VALID_RULE_KINDS = frozenset({"durable_invariant", "model_workaround", "preference"})
 VALID_OUTCOMES = frozenset({"pending", "improved", "regressed", "neutral", "failed"})
@@ -148,30 +154,32 @@ class SIMMemory:
     def _write_event(self, event: Mapping[str, Any]) -> None:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            safe_event = redact_secrets_in_value(event)
             with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(canonical_json_bytes(event).decode("ascii") + "\n")
+                fh.write(canonical_json_bytes(safe_event).decode("ascii") + "\n")
 
     def register_rule(self, record: SIMRuleRecord) -> SIMRuleRecord:
         if record.rule_kind not in VALID_RULE_KINDS:
             raise ValueError(f"invalid rule_kind: {record.rule_kind!r}")
         if not record.capability_id.strip():
             raise ValueError("capability_id must be non-empty")
-        self._rules[record.rule_id] = record
-        self._write_event({"op": "register_rule", "record": record.to_dict()})
+        safe_record = SIMRuleRecord.from_dict(redact_secrets_in_value(record.to_dict()))
+        self._rules[safe_record.rule_id] = safe_record
+        self._write_event({"op": "register_rule", "record": safe_record.to_dict()})
         if self.ledger is not None:
             self.ledger.append(
                 "sim_rule_registered",
                 "exo-sim",
                 {
-                    "rule_id": record.rule_id,
-                    "capability_id": record.capability_id,
-                    "rule_kind": record.rule_kind,
-                    "adapter_id": record.adapter_id,
-                    "base_checkpoint_sha": record.base_checkpoint_sha,
-                    "corpus_sha": record.corpus_sha,
+                    "rule_id": safe_record.rule_id,
+                    "capability_id": safe_record.capability_id,
+                    "rule_kind": safe_record.rule_kind,
+                    "adapter_id": safe_record.adapter_id,
+                    "base_checkpoint_sha": safe_record.base_checkpoint_sha,
+                    "corpus_sha": safe_record.corpus_sha,
                 },
             )
-        return record
+        return safe_record
 
     def record_attempt(self, rule_id: str, attempt: SIMAttempt) -> SIMAttempt:
         """Append an attempt without ever deleting earlier failed or superseded attempts."""
@@ -181,38 +189,40 @@ class SIMMemory:
             raise ValueError(f"invalid attempt outcome: {attempt.outcome!r}")
         if not attempt.predicted.strip():
             raise ValueError("attempt must log predicted effect before evaluation")
-        self._rules[rule_id].attempts.append(attempt)
-        self._write_event({"op": "append_attempt", "rule_id": rule_id, "attempt": attempt.to_dict()})
+        safe_attempt = SIMAttempt.from_dict(redact_secrets_in_value(attempt.to_dict()))
+        self._rules[rule_id].attempts.append(safe_attempt)
+        self._write_event({"op": "append_attempt", "rule_id": rule_id, "attempt": safe_attempt.to_dict()})
         if self.ledger is not None:
             self.ledger.append(
                 "sim_attempt_recorded",
                 "exo-sim",
                 {
                     "rule_id": rule_id,
-                    "round_id": attempt.round_id,
-                    "outcome": attempt.outcome,
-                    "base_checkpoint_sha": attempt.base_checkpoint_sha,
-                    "corpus_sha": attempt.corpus_sha,
+                    "round_id": safe_attempt.round_id,
+                    "outcome": safe_attempt.outcome,
+                    "base_checkpoint_sha": safe_attempt.base_checkpoint_sha,
+                    "corpus_sha": safe_attempt.corpus_sha,
                 },
             )
-        return attempt
+        return safe_attempt
 
     def mark_contested(self, rule_id: str, reason: str, *, contested: bool = True) -> None:
         if rule_id not in self._rules:
             raise KeyError(f"unknown rule_id: {rule_id}")
+        safe_reason = redact_secrets_in_text(reason)
         self._rules[rule_id].contested = contested
-        self._rules[rule_id].contested_reason = reason
+        self._rules[rule_id].contested_reason = safe_reason
         self._write_event({
             "op": "mark_contested",
             "rule_id": rule_id,
             "contested": contested,
-            "reason": reason,
+            "reason": safe_reason,
         })
         if self.ledger is not None:
             self.ledger.append(
                 "sim_rule_contested",
                 "exo-sim",
-                {"rule_id": rule_id, "contested": contested, "reason": reason},
+                {"rule_id": rule_id, "contested": contested, "reason": safe_reason},
             )
 
     def rules(self) -> list[SIMRuleRecord]:

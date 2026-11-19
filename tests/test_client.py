@@ -5,6 +5,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import socketserver
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 from contextlib import redirect_stdout
 
 from exo.bridge import (
+    build_warp_adapter_bundle,
     build_warp_bundles_for_route,
     scale_to_rational,
     translate_weft_certificate_to_warp,
@@ -521,6 +523,108 @@ class TestWarpUnixBridgeAndSchemaAdapter(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
                 thread.join(timeout=2.0)
+
+    def test_schema_bridge_rejects_bool_float_and_str_integer_coercion(self) -> None:
+        base_cert = {
+            "radix_scale_exp2": 24,
+            "frobenius_sq_scaled": 16777216,
+            "spectral_norm_sq_scaled": 4194304,
+            "leakage_energy_scaled": 1024,
+            "max_safety_dot_sq_scaled": 0,
+        }
+        for field_name, bad_val in (
+            ("radix_scale_exp2", True),
+            ("radix_scale_exp2", 24.0),
+            ("radix_scale_exp2", "24"),
+            ("frobenius_sq_scaled", 16777216.9),
+            ("frobenius_sq_scaled", False),
+            ("spectral_norm_sq_scaled", 1.5),
+            ("leakage_energy_scaled", True),
+            ("max_safety_dot_sq_scaled", "0"),
+        ):
+            mutated = dict(base_cert)
+            mutated[field_name] = bad_val
+            with self.assertRaises(TypeError, msg=f"{field_name}={bad_val!r} should fail"):
+                translate_weft_certificate_to_warp(
+                    mutated,
+                    adapter_id="mde:corpus",
+                    adapter_sha256="a" * 64,
+                    base_weights_sha256="b" * 64,
+                )
+
+        # Negative metric also rejected
+        neg_cert = dict(base_cert, leakage_energy_scaled=-1)
+        with self.assertRaises(ValueError):
+            translate_weft_certificate_to_warp(
+                neg_cert,
+                adapter_id="mde:corpus",
+                adapter_sha256="a" * 64,
+                base_weights_sha256="b" * 64,
+            )
+
+        # Strict denominator, non-bool scale, and strict llama_adapter_id
+        with self.assertRaises(TypeError):
+            scale_to_rational(1.0, denominator=True)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            scale_to_rational(True)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            scale_to_rational(float("nan"))
+
+        manifest = {
+            "layout_sha256": "1" * 64,
+            "checkpoint_fingerprint": "2" * 64,
+            "config_hashes": {"config.json": "3" * 64},
+            "tokenizer_hashes": {"tokenizer.json": "4" * 64, "chat_template.jinja": "5" * 64},
+        }
+        with self.assertRaises(TypeError):
+            build_warp_adapter_bundle(
+                adapter_id="mde:corpus",
+                domain="corpus",
+                llama_adapter_id=True,  # type: ignore[arg-type]
+                weft_manifest=manifest,
+                weft_certificate=base_cert,
+                gguf_sha256="c" * 64,
+                model_id="Synthetic-W0",
+                source_lineage={"corpus_tree_sha256": "d" * 64, "domain_commits": {"corpus": "e" * 40}},
+                runtime_flags_sha256="f" * 64,
+            )
+
+    def test_stdio_transport_strips_ambient_parent_credentials_by_default(self) -> None:
+        import sys
+
+        probe_script = (
+            "import json, os, sys\n"
+            "for line in sys.stdin:\n"
+            "  req = json.loads(line)\n"
+            "  seen = {\n"
+            "    'has_aws': 'AWS_SECRET_ACCESS_KEY' in os.environ,\n"
+            "    'has_gh': 'GH_TOKEN' in os.environ,\n"
+            "    'has_path': 'PATH' in os.environ,\n"
+            "  }\n"
+            "  res = {'content': [], 'structuredContent': seen, 'isError': False}\n"
+            "  sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': res}) + '\\n')\n"
+            "  sys.stdout.flush()\n"
+        )
+        prev_aws = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        prev_gh = os.environ.get("GH_TOKEN")
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "synthetic-aws-secret-for-test"
+        os.environ["GH_TOKEN"] = "synthetic-gh-token-for-test"
+        try:
+            with StdioJsonRpcTransport([sys.executable, "-c", probe_script]) as transport:
+                client = MdeClient(transport, actor_id="exo-env-test")
+                res = client.splice_locate("src/app.py")
+                self.assertFalse(res["has_aws"])
+                self.assertFalse(res["has_gh"])
+                self.assertTrue(res["has_path"])
+        finally:
+            if prev_aws is None:
+                os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+            else:
+                os.environ["AWS_SECRET_ACCESS_KEY"] = prev_aws
+            if prev_gh is None:
+                os.environ.pop("GH_TOKEN", None)
+            else:
+                os.environ["GH_TOKEN"] = prev_gh
 
 
 if __name__ == "__main__":

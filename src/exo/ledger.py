@@ -8,9 +8,74 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+import re
 from typing import Any, Mapping, Optional
 
 GENESIS_HASH = "0" * 64
+REDACTED_PLACEHOLDER = "[REDACTED]"
+
+# Pre-JSON raw-string secret patterns (applied BEFORE json.dumps escaping so
+# multiline PEM private keys and quoted secrets cannot slip past JSON escaping).
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+        ),
+        REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+        REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+        REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}\b"),
+        REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+        REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}"),
+        r"\1" + REDACTED_PLACEHOLDER,
+    ),
+    (
+        re.compile(
+            r'(?i)(\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|'
+            r'client[_-]?secret|private[_-]?key|password|passwd)\s*[:=]\s*)'
+            r'(?!sha256:)(?!\[REDACTED\])["\']?([^\s"\',;}{]{8,})["\']?'
+        ),
+        r"\1" + REDACTED_PLACEHOLDER,
+    ),
+)
+
+
+def redact_secrets_in_text(text: str) -> str:
+    """Redact raw private keys, tokens, and credentials on unescaped text."""
+    out = text
+    for pattern, repl in _SECRET_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def redact_secrets_in_value(value: Any) -> Any:
+    """Recursively redact secrets on raw Python strings BEFORE JSON serialization."""
+    if isinstance(value, str):
+        return redact_secrets_in_text(value)
+    if isinstance(value, Mapping):
+        return {
+            (redact_secrets_in_text(k) if isinstance(k, str) else k): redact_secrets_in_value(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_secrets_in_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_secrets_in_value(item) for item in value]
+    return value
 
 
 def utc_now_iso() -> str:
@@ -134,12 +199,14 @@ class AppendOnlyLedger:
         seq = len(self._entries) + 1
         ts = timestamp_utc or utc_now_iso()
         prev = self.head_sha256
+        safe_actor = redact_secrets_in_text(actor_id)
+        safe_payload = redact_secrets_in_value(dict(payload))
         body = {
             "seq": seq,
             "timestamp_utc": ts,
             "event_type": event_type,
-            "actor_id": actor_id,
-            "payload": dict(payload),
+            "actor_id": safe_actor,
+            "payload": safe_payload,
             "prev_sha256": prev,
         }
         body_bytes = canonical_json_bytes(body)
@@ -154,8 +221,8 @@ class AppendOnlyLedger:
             seq=seq,
             timestamp_utc=ts,
             event_type=event_type,
-            actor_id=actor_id,
-            payload=dict(payload),
+            actor_id=safe_actor,
+            payload=safe_payload,
             prev_sha256=prev,
             entry_sha256=entry_hash,
             signature_kind=sig_kind,

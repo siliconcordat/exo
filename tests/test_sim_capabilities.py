@@ -190,6 +190,45 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
             self.assertEqual(by_id["rule.tone-preference"].action, "escalate_human")
             self.assertEqual(ledger.verify_chain(), [])
 
+    def test_sim_memory_pre_json_redacts_secrets_in_journal_and_memory(self) -> None:
+        gh_tok = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8"
+        pem_blob = "-----BEGIN " + "EC PRIVATE KEY-----\nSECRET_BODY_LINE\n-----END " + "EC PRIVATE KEY-----"
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_path = Path(tmp) / "sim-redacted.jsonl"
+            ledger = AppendOnlyLedger(Path(tmp) / "ledger.jsonl")
+            sim = SIMMemory(sim_path, ledger=ledger)
+            rec = sim.register_rule(
+                SIMRuleRecord(
+                    rule_id="rule.secret-test",
+                    capability_id="cap.audit",
+                    name="Redact raw secret",
+                    problem=f"Observed leak {gh_tok} and\n{pem_blob}",
+                    rule_kind="durable_invariant",
+                    adapter_id="corpus",
+                    base_checkpoint_sha="a" * 64,
+                    corpus_sha="b" * 64,
+                )
+            )
+            att = sim.record_attempt(
+                "rule.secret-test",
+                SIMAttempt(
+                    round_id=1,
+                    what=f"Saw api_key=myTopSecretVal12345 in trace",
+                    predicted="Secret is redacted before JSON write",
+                    fixed=("redacted",),
+                    missed=(),
+                    base_checkpoint_sha="a" * 64,
+                    corpus_sha="b" * 64,
+                    outcome="improved",
+                ),
+            )
+            raw_journal = sim_path.read_text(encoding="utf-8")
+            for leaked in (gh_tok, "SECRET_BODY_LINE", "myTopSecretVal12345"):
+                self.assertNotIn(leaked, raw_journal)
+                self.assertNotIn(leaked, rec.problem)
+                self.assertNotIn(leaked, att.what)
+            self.assertEqual(ledger.verify_chain(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

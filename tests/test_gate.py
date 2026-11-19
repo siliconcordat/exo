@@ -7,8 +7,10 @@ import unittest
 from exo.gate import (
     ActionEnvelope,
     ApprovalGate,
+    DEFAULT_ALLOWED_TOOL_ENV_KEYS,
     decode_git_path,
     normalize_repo_path,
+    scrub_tool_env,
     unwrap_command_argv,
 )
 from exo.ledger import AppendOnlyLedger
@@ -213,6 +215,99 @@ class TestApprovalGate(unittest.TestCase):
             self.assertIn(expected_reason, reasons, f"missed {expected_reason} for {argv}: {reasons}")
             verdict = gate.evaluate(ActionEnvelope(action_kind="tool_call", target="git", argv=tuple(argv)))
             self.assertEqual(verdict.decision, "require_human_approval", argv)
+
+    def test_human_stop_takeover_fence_cancels_continuations_monotonically(self) -> None:
+        ledger = AppendOnlyLedger()
+        gate = ApprovalGate(signing_key=b"fence-key", ledger=ledger)
+        routine_env = ActionEnvelope(
+            action_kind="splice_patch",
+            target="src/app/math.py",
+            paths=("src/app/math.py",),
+            read_tokens=("tok-1",),
+        )
+        high_risk_env = ActionEnvelope(
+            action_kind="splice_patch",
+            target="security/policy_gate.py",
+            paths=("security/policy_gate.py",),
+            read_tokens=("tok-2",),
+        )
+        # Issue autonomous continuation token at epoch 0 and sign a high-risk approval
+        tok0 = gate.issue_continuation("worker-loop")
+        self.assertEqual(tok0.fence_epoch, 0)
+        self.assertEqual(gate.evaluate(routine_env, continuation=tok0).decision, "allow")
+        challenge = gate.evaluate(high_risk_env).challenge
+        assert challenge is not None
+        pre_signed = gate.sign_approval(challenge, approver_id="owner")
+
+        # Human raises stop / takeover signal -> epoch advances to 1, ALL pending actions denied
+        epoch1 = gate.raise_human_stop("owner", "manual takeover during review")
+        self.assertEqual(epoch1, 1)
+        self.assertTrue(gate.is_halted)
+
+        v_routine = gate.evaluate(routine_env, continuation=tok0)
+        self.assertEqual(v_routine.decision, "deny")
+        self.assertTrue(any("human_stop_active" in r for r in v_routine.reasons))
+
+        v_high = gate.evaluate(high_risk_env, approval=pre_signed)
+        self.assertEqual(v_high.decision, "deny")
+        self.assertTrue(any("human_stop_active" in r for r in v_high.reasons))
+
+        # Cannot issue new continuation while halted, nor clear without >=8 char confirmation
+        with self.assertRaises(RuntimeError):
+            gate.issue_continuation("blocked")
+        with self.assertRaises(ValueError):
+            gate.clear_human_stop("owner", "short")
+
+        # Clearing stop advances epoch to 2 -> pre-stop tok0 stays permanently invalidated
+        epoch2 = gate.clear_human_stop("owner", "resume-verified-by-human")
+        self.assertEqual(epoch2, 2)
+        self.assertFalse(gate.is_halted)
+        ok_old, err_old = gate.check_continuation(tok0)
+        self.assertFalse(ok_old)
+        self.assertIn("stale_fence_epoch", err_old or "")
+
+        v_stale = gate.evaluate(routine_env, continuation=tok0)
+        self.assertEqual(v_stale.decision, "deny")
+        self.assertTrue(any("stale_fence_epoch" in r for r in v_stale.reasons))
+
+        # Fresh epoch-2 continuation succeeds
+        tok2 = gate.issue_continuation("post-resume")
+        self.assertEqual(tok2.fence_epoch, 2)
+        self.assertEqual(gate.evaluate(routine_env, continuation=tok2).decision, "allow")
+        self.assertEqual(ledger.verify_chain(signing_key=b"fence-key", require_signatures=True), [])
+
+    def test_authoritative_scrubbed_tool_env_blocks_ambient_parent_credentials(self) -> None:
+        parent = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/tmp/sandbox-home",
+            "LANG": "C.UTF-8",
+            "AWS_SECRET_ACCESS_KEY": "synthetic-aws-secret",
+            "AWS_ACCESS_KEY_ID": "synthetic-aws-id",
+            "GH_TOKEN": "synthetic-gh-token",
+            "GITHUB_TOKEN": "synthetic-github-token",
+            "OPENAI_API_KEY": "synthetic-openai-key",
+            "ANTHROPIC_API_KEY": "synthetic-anthropic-key",
+            "HF_TOKEN": "synthetic-hf-token",
+            "DB_PASSWORD": "synthetic-db-password",
+            "CUSTOM_UNLISTED_VAR": "should-not-pass",
+        }
+        scrubbed = scrub_tool_env(parent, explicit_overrides={"PYTHONPATH": "src"})
+        self.assertEqual(
+            scrubbed,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/tmp/sandbox-home",
+                "LANG": "C.UTF-8",
+                "PYTHONPATH": "src",
+            },
+        )
+        for key in ("AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "OPENAI_API_KEY", "DB_PASSWORD", "CUSTOM_UNLISTED_VAR"):
+            self.assertNotIn(key, scrubbed)
+
+        # Credential-shaped keys passed in allowlist fail closed
+        for bad_allow in ("AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "API_KEY", "MY_PASSWORD"):
+            with self.assertRaises(ValueError):
+                scrub_tool_env(parent, allowlist=(*DEFAULT_ALLOWED_TOOL_ENV_KEYS, bad_allow))
 
 
 if __name__ == "__main__":

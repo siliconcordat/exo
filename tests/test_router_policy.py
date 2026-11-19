@@ -16,7 +16,13 @@ from exo.policy import (
     validate_change_against_policy,
     weft_eido_repo_policy,
 )
-from exo.router import ContestedPreferenceError, RouteRequest, ZoneRouter
+from exo.router import (
+    ContestedPreferenceError,
+    RouteRequest,
+    ZoneManifestError,
+    ZoneRouter,
+    compute_zone_manifest_id,
+)
 
 
 class TestZoneRouterAndPolicy(unittest.TestCase):
@@ -213,6 +219,134 @@ class TestZoneRouterAndPolicy(unittest.TestCase):
             p.write_text(json.dumps(f0_pol.to_dict()), encoding="utf-8")
             loaded = RepoPolicy.load(p)
             self.assertEqual(loaded, f0_pol)
+
+    def test_zone_router_from_l5_zone_manifest_verifies_digest_and_compiles_rules(self) -> None:
+        body = {
+            "schema": "zone-manifest/v0.1",
+            "mde_version": "0.1.0",
+            "precedence_order": ["formal_proof", "condensed_json", "ui_module", "code", "prose"],
+            "zones": [
+                {
+                    "zone": "formal_proof",
+                    "l1_bank_tag": 3,
+                    "protection_flags": {
+                        "protect_axioms": True,
+                        "protect_sha_digests": True,
+                        "protect_exact_keys": True,
+                        "respect_data_eido_skip": True,
+                        "preserve_sibling_comments": True,
+                        "enforce_prose_guard": False,
+                        "prose_rewrite_allowed": False,
+                    },
+                    "default_l2_scales": {"corpus": 0.0, "formal-verification": 1.0, "weft-eido": 0.0},
+                },
+                {
+                    "zone": "condensed_json",
+                    "l1_bank_tag": 4,
+                    "protection_flags": {
+                        "protect_axioms": False,
+                        "protect_sha_digests": True,
+                        "protect_exact_keys": True,
+                        "respect_data_eido_skip": True,
+                        "preserve_sibling_comments": False,
+                        "enforce_prose_guard": False,
+                        "prose_rewrite_allowed": False,
+                    },
+                    "default_l2_scales": {"corpus": 0.0, "formal-verification": 0.0, "weft-eido": 0.0},
+                },
+                {
+                    "zone": "ui_module",
+                    "l1_bank_tag": 2,
+                    "protection_flags": {
+                        "protect_axioms": False,
+                        "protect_sha_digests": True,
+                        "protect_exact_keys": False,
+                        "respect_data_eido_skip": True,
+                        "preserve_sibling_comments": True,
+                        "enforce_prose_guard": False,
+                        "prose_rewrite_allowed": False,
+                    },
+                    "default_l2_scales": {"corpus": 0.2, "formal-verification": 0.0, "weft-eido": 1.0},
+                },
+                {
+                    "zone": "code",
+                    "l1_bank_tag": 1,
+                    "protection_flags": {
+                        "protect_axioms": False,
+                        "protect_sha_digests": True,
+                        "protect_exact_keys": False,
+                        "respect_data_eido_skip": True,
+                        "preserve_sibling_comments": True,
+                        "enforce_prose_guard": False,
+                        "prose_rewrite_allowed": False,
+                    },
+                    "default_l2_scales": {"corpus": 0.4, "formal-verification": 0.5, "weft-eido": 0.0},
+                },
+                {
+                    "zone": "prose",
+                    "l1_bank_tag": 0,
+                    "protection_flags": {
+                        "protect_axioms": False,
+                        "protect_sha_digests": True,
+                        "protect_exact_keys": False,
+                        "respect_data_eido_skip": False,
+                        "preserve_sibling_comments": True,
+                        "enforce_prose_guard": True,
+                        "prose_rewrite_allowed": True,
+                    },
+                    "default_l2_scales": {"corpus": 1.0, "formal-verification": 0.0, "weft-eido": 0.0},
+                },
+            ],
+        }
+        manifest = dict(body)
+        manifest["manifest_id"] = compute_zone_manifest_id(body)
+
+        ledger = AppendOnlyLedger()
+        router = ZoneRouter.from_zone_manifest(manifest, ledger=ledger)
+        self.assertEqual(router.manifest_id, manifest["manifest_id"])
+
+        # Compiled ui_module uses exact manifest scales (corpus=0.2, weft-eido=1.0) and l1_bank_tag=2
+        ui_dec = router.route(
+            RouteRequest(
+                zone="ui_module",
+                active_domains=("corpus", "weft-eido", "formal-verification"),
+                repo_policy=weft_eido_repo_policy(),
+            )
+        )
+        self.assertEqual(ui_dec.scale_map(), {"corpus": 0.2, "weft-eido": 1.0, "formal-verification": 0.0})
+        self.assertEqual(ui_dec.l1_bank_tag, 2)
+        self.assertEqual(ui_dec.manifest_id, manifest["manifest_id"])
+
+        # Compiled formal_proof enforces data-eido-skip and exact math with l1_bank_tag=3
+        fp_dec = router.route(
+            RouteRequest(
+                zone="formal_proof",
+                active_domains=("corpus", "weft-eido", "formal-verification"),
+                repo_policy=foundation0_repo_policy(),
+            )
+        )
+        self.assertEqual(fp_dec.scale_map(), {"corpus": 0.0, "weft-eido": 0.0, "formal-verification": 1.0})
+        self.assertEqual(fp_dec.l1_bank_tag, 3)
+        self.assertTrue(fp_dec.constraints.enforce_data_eido_skip)
+        self.assertTrue(fp_dec.constraints.forbid_float_in_exact_math)
+
+        # Hard Veto 2 still escalates on generic code with dual specialists
+        with self.assertRaises(ContestedPreferenceError):
+            router.route(
+                RouteRequest(
+                    zone="code",
+                    active_domains=("corpus", "weft-eido", "formal-verification"),
+                    repo_policy=foundation0_repo_policy(),
+                )
+            )
+
+        # Any 1-byte tamper in the manifest fails closed on manifest_id SHA-256 verification
+        tampered = json.loads(json.dumps(manifest))
+        tampered["zones"][0]["default_l2_scales"]["corpus"] = 0.9
+        with self.assertRaises(ZoneManifestError):
+            ZoneRouter.from_zone_manifest(tampered)
+
+        self.assertEqual(ledger.verify_chain(), [])
 
 
 if __name__ == "__main__":

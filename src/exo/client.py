@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 import urllib.error
 import urllib.request
 
-from exo.gate import ActionEnvelope, ApprovalGate, HumanApproval, normalize_repo_path
+from exo.gate import ActionEnvelope, ApprovalGate, HumanApproval, normalize_repo_path, scrub_tool_env
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes
 from exo.router import RouteDecision
 
@@ -72,15 +72,23 @@ class InMemoryJsonRpcTransport:
 class StdioJsonRpcTransport:
     """Line-delimited JSON-RPC 2.0 stdio transport for live L5 siliconcordat/mde servers."""
 
-    def __init__(self, command: Sequence[str], *, cwd: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> None:
         if not command:
             raise ValueError("command must be non-empty")
+        child_env = scrub_tool_env() if env is None else dict(env)
         self._proc = subprocess.Popen(
             list(command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=cwd,
+            env=child_env,
             text=True,
             encoding="utf-8",
         )

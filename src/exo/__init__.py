@@ -22,13 +22,23 @@ from exo.gate import (
     ActionEnvelope,
     ApprovalChallenge,
     ApprovalGate,
+    ContinuationToken,
+    DEFAULT_ALLOWED_TOOL_ENV_KEYS,
     GateVerdict,
     HumanApproval,
     decode_git_path,
     normalize_repo_path,
+    scrub_tool_env,
     unwrap_command_argv,
 )
-from exo.ledger import AppendOnlyLedger, LedgerEntry, canonical_json_bytes, sha256_hex
+from exo.ledger import (
+    AppendOnlyLedger,
+    LedgerEntry,
+    canonical_json_bytes,
+    redact_secrets_in_text,
+    redact_secrets_in_value,
+    sha256_hex,
+)
 from exo.policy import (
     RepoPolicy,
     corpus_repo_policy,
@@ -38,7 +48,17 @@ from exo.policy import (
     validate_change_against_policy,
     weft_eido_repo_policy,
 )
-from exo.router import ContestedPreferenceError, RouteDecision, RouteRequest, ZoneConstraints, ZoneRouter
+from exo.router import (
+    ContestedPreferenceError,
+    RouteDecision,
+    RouteRequest,
+    ZoneConstraints,
+    ZoneManifestError,
+    ZoneManifestRule,
+    ZoneRouter,
+    compute_zone_manifest_id,
+    verify_zone_manifest,
+)
 from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMAttempt, SIMMemory, SIMRuleRecord, UpgradeAction, UpgradePlan
 
 __all__ = [
@@ -51,7 +71,9 @@ __all__ = [
     "CapabilityCharter",
     "CapabilityRegistry",
     "ContestedPreferenceError",
+    "ContinuationToken",
     "CrossGenerationPlanner",
+    "DEFAULT_ALLOWED_TOOL_ENV_KEYS",
     "GateVerdict",
     "HumanApproval",
     "InMemoryJsonRpcTransport",
@@ -73,21 +95,28 @@ __all__ = [
     "WarpModeldBridge",
     "WarpUnixBridge",
     "ZoneConstraints",
+    "ZoneManifestError",
+    "ZoneManifestRule",
     "ZoneRouter",
     "build_warp_adapter_bundle",
     "build_warp_bundles_for_route",
     "canonical_json_bytes",
+    "compute_zone_manifest_id",
     "corpus_repo_policy",
     "decode_git_path",
     "foundation0_repo_policy",
     "normalize_repo_path",
     "proven_commons_repo_policy",
+    "redact_secrets_in_text",
+    "redact_secrets_in_value",
     "scale_to_rational",
+    "scrub_tool_env",
     "sha256_hex",
     "siliconcordat_repo_policy",
     "translate_weft_certificate_to_warp",
     "translate_weft_checkpoint_to_warp",
     "unwrap_command_argv",
     "validate_change_against_policy",
+    "verify_zone_manifest",
     "weft_eido_repo_policy",
 ]

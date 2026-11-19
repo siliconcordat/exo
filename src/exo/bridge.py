@@ -15,10 +15,23 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 import hashlib
+import math
 from typing import Any, Mapping, Optional
 
 from exo.ledger import canonical_json_bytes
 from exo.router import RouteDecision
+
+
+def _require_strict_int(value: Any, name: str, *, allow_zero: bool = True) -> int:
+    """Enforce exact Python int (rejecting bool, float, str, and negative values)."""
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an exact int (got {type(value).__name__})")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative (got {value})")
+    elif value <= 0:
+        raise ValueError(f"{name} must be strictly positive (got {value})")
+    return value
 
 
 def _as_mapping(obj: Any) -> dict[str, Any]:
@@ -35,14 +48,16 @@ def _sha256_canonical(payload: Mapping[str, Any]) -> str:
 
 def scale_to_rational(scale: float, *, denominator: int = 1000) -> tuple[int, int]:
     """Convert a positive float LoRA scale into warp's strict (scale_num, scale_den)."""
-    if denominator <= 0:
-        raise ValueError("denominator must be strictly positive")
-    if scale <= 0.0:
-        raise ValueError(f"warp AdapterBundle requires positive scale; got {scale}")
-    num = int(round(float(scale) * denominator))
+    den = _require_strict_int(denominator, "denominator", allow_zero=False)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise TypeError(f"scale must be a real number (got {type(scale).__name__})")
+    scale_f = float(scale)
+    if not math.isfinite(scale_f) or scale_f <= 0.0:
+        raise ValueError(f"warp AdapterBundle requires finite positive scale; got {scale}")
+    num = int(round(scale_f * den))
     if num <= 0:
-        raise ValueError(f"scale {scale} rounds to non-positive numerator at denominator {denominator}")
-    return num, int(denominator)
+        raise ValueError(f"scale {scale} rounds to non-positive numerator at denominator {den}")
+    return num, den
 
 
 def translate_weft_certificate_to_warp(
@@ -54,20 +69,19 @@ def translate_weft_certificate_to_warp(
 ) -> dict[str, Any]:
     """Translate an L2 weft FixedRadixCertificate into an L3 warp FixedRadixCertificate dict.
 
-    Preserves the four exact scaled integer witness metrics and expands weft's
-    `radix_scale_exp2` exponent into warp's explicit `radix_scale = 1 << exp2`,
-    then computes warp's embedded canonical `cert_sha256`.
+    Preserves the four exact scaled integer witness metrics without silent
+    coercion, expands weft's `radix_scale_exp2` exponent into warp's explicit
+    `radix_scale = 1 << exp2`, and computes warp's embedded canonical
+    `cert_sha256`.
     """
     cert = _as_mapping(weft_certificate)
     if "radix_scale_exp2" in cert:
-        exp2 = int(cert["radix_scale_exp2"])
+        exp2 = _require_strict_int(cert["radix_scale_exp2"], "radix_scale_exp2", allow_zero=False)
         if not (8 <= exp2 <= 48):
             raise ValueError(f"weft radix_scale_exp2 out of range [8, 48]: {exp2}")
         radix_scale = 1 << exp2
     elif "radix_scale" in cert:
-        radix_scale = int(cert["radix_scale"])
-        if radix_scale <= 0:
-            raise ValueError(f"radix_scale must be positive: {radix_scale}")
+        radix_scale = _require_strict_int(cert["radix_scale"], "radix_scale", allow_zero=False)
     else:
         raise KeyError("weft certificate missing both 'radix_scale_exp2' and 'radix_scale'")
 
@@ -76,10 +90,14 @@ def translate_weft_certificate_to_warp(
         "adapter_sha256": str(adapter_sha256),
         "base_weights_sha256": str(base_weights_sha256),
         "radix_scale": radix_scale,
-        "frobenius_sq_scaled": int(cert["frobenius_sq_scaled"]),
-        "spectral_norm_sq_scaled": int(cert["spectral_norm_sq_scaled"]),
-        "leakage_energy_scaled": int(cert["leakage_energy_scaled"]),
-        "max_safety_dot_sq_scaled": int(cert["max_safety_dot_sq_scaled"]),
+        "frobenius_sq_scaled": _require_strict_int(cert["frobenius_sq_scaled"], "frobenius_sq_scaled"),
+        "spectral_norm_sq_scaled": _require_strict_int(
+            cert["spectral_norm_sq_scaled"], "spectral_norm_sq_scaled"
+        ),
+        "leakage_energy_scaled": _require_strict_int(cert["leakage_energy_scaled"], "leakage_energy_scaled"),
+        "max_safety_dot_sq_scaled": _require_strict_int(
+            cert["max_safety_dot_sq_scaled"], "max_safety_dot_sq_scaled"
+        ),
     }
     out = dict(body)
     out["cert_sha256"] = _sha256_canonical(body)
@@ -139,13 +157,14 @@ def build_warp_adapter_bundle(
         adapter_sha256=gguf_sha256,
         base_weights_sha256=checkpoint["weights_sha256"],
     )
+    llama_id = _require_strict_int(llama_adapter_id, "llama_adapter_id", allow_zero=True)
     scale_num, scale_den = scale_to_rational(scale, denominator=scale_denominator)
     derivation_digest = _sha256_canonical(manifest)
 
     return {
         "adapter_id": str(adapter_id),
         "domain": str(domain),
-        "llama_adapter_id": int(llama_adapter_id),
+        "llama_adapter_id": llama_id,
         "adapter_sha256": str(gguf_sha256),
         "adapter_path": str(adapter_path) if adapter_path is not None else None,
         "scale_num": scale_num,
@@ -197,7 +216,7 @@ def build_warp_bundles_for_route(
             build_warp_adapter_bundle(
                 adapter_id=str(spec["adapter_id"]),
                 domain=domain,
-                llama_adapter_id=int(spec["llama_adapter_id"]),
+                llama_adapter_id=spec["llama_adapter_id"],
                 weft_manifest=spec["weft_manifest"],
                 weft_certificate=spec["weft_certificate"],
                 gguf_sha256=str(spec["gguf_sha256"]),

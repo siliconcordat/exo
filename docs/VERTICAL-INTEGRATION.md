@@ -45,8 +45,8 @@ PYTHONPATH=src python3 -B -W error examples/vertical_splice_demo.py
 
 Measured locally on macOS with Python 3.14 and compiled Rust `mde`:
 
-- Standalone offline `unittest`: 32 tests discovered, 31 passed, 1 skipped in `1.594s` under `-B -W error`.
-- Live four-layer `unittest`: 32 tests discovered, 32 passed, 0 skipped in `3.595s` under `-B -W error`.
+- Standalone offline `unittest`: 40 tests discovered, 38 passed, 2 skipped cleanly under both `-B -W error` and `-O -B -W error`.
+- Live four-layer `unittest`: 40 tests discovered, 40 passed, 0 skipped under both `-B -W error` and `-O -B -W error` (`3.635s`, including live verification of `mde` `schemas/zone-manifest.v0.1.json` via `ZoneRouter.from_zone_manifest_file`).
 - Direct CLI run of `examples/vertical_splice_demo.py`: completed all five stages in `1509.46 ms`.
 
 | Stage | Layer | Verified behavior | Measured output |

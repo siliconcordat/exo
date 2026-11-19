@@ -6,11 +6,71 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hmac
 import math
+import os
 import posixpath
 import re
+import threading
 from typing import Any, Mapping, Optional, Sequence
 
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes, hmac_sha256_hex, sha256_hex, utc_now_iso
+
+# Authoritative allowlist of non-credential ambient environment variables safe to
+# forward to child tool processes (exo-desktop#71: never restore ambient parent credentials).
+DEFAULT_ALLOWED_TOOL_ENV_KEYS: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "NO_COLOR",
+)
+
+_FORBIDDEN_ENV_KEY_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL|CREDENTIALS|"
+    r"AUTH|COOKIE|SESSION_KEY|ACCESS_KEY|CLIENT_SECRET)(?:$|_)|"
+    r"^(?:AWS_|GITHUB_|GH_|OPENAI_|ANTHROPIC_|GEMINI_|HF_|GOOGLE_API|STRIPE_|SLACK_)",
+    re.IGNORECASE,
+)
+
+
+def scrub_tool_env(
+    parent_env: Optional[Mapping[str, str]] = None,
+    *,
+    allowlist: Sequence[str] = DEFAULT_ALLOWED_TOOL_ENV_KEYS,
+    explicit_overrides: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    """Build an authoritative scrubbed child-process environment from an explicit allowlist.
+
+    Starts from an empty dictionary instead of copying parent os.environ so ambient
+    host credentials can never leak into spawned tools. Credential-shaped keys in
+    `allowlist` are rejected fail-closed.
+    """
+    source = os.environ if parent_env is None else parent_env
+    clean: dict[str, str] = {}
+    for key in allowlist:
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"invalid env allowlist key: {key!r}")
+        if _FORBIDDEN_ENV_KEY_RE.search(key):
+            raise ValueError(f"credential-shaped key forbidden in tool env allowlist: {key!r}")
+        if key in source:
+            val = source[key]
+            if isinstance(val, str):
+                clean[key] = val
+    if explicit_overrides is not None:
+        for key, val in explicit_overrides.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"invalid explicit override key: {key!r}")
+            if not isinstance(val, str):
+                raise TypeError(f"env value for {key!r} must be str")
+            clean[key] = val
+    return clean
 
 # Wrapper flags that execute an embedded shell command string and must always escalate.
 WRAPPER_SHELL_EXEC_FLAGS: dict[str, frozenset[str]] = {
@@ -517,6 +577,15 @@ class HumanApproval:
 
 
 @dataclass(frozen=True)
+class ContinuationToken:
+    """Monotonic autonomous continuation token bound to an ApprovalGate fence_epoch."""
+
+    fence_epoch: int
+    issued_at_utc: str
+    label: str = "autonomous"
+
+
+@dataclass(frozen=True)
 class GateVerdict:
     """Result of evaluating an ActionEnvelope at the Layer 4 gate."""
 
@@ -528,7 +597,7 @@ class GateVerdict:
 
 
 class ApprovalGate:
-    """Deterministic exact-byte human approval gate."""
+    """Deterministic exact-byte human approval gate with atomic human-stop fence."""
 
     def __init__(
         self,
@@ -542,6 +611,98 @@ class ApprovalGate:
         self.max_auto_spend_usd = float(max_auto_spend_usd)
         self.signing_key = signing_key
         self.ledger = ledger
+        self._fence_lock = threading.Lock()
+        self._fence_epoch = 0
+        self._halted = False
+        self._stop_reason: Optional[str] = None
+        self._stopped_by: Optional[str] = None
+
+    @property
+    def fence_epoch(self) -> int:
+        with self._fence_lock:
+            return self._fence_epoch
+
+    @property
+    def is_halted(self) -> bool:
+        with self._fence_lock:
+            return self._halted
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        with self._fence_lock:
+            return self._stop_reason
+
+    def issue_continuation(self, label: str = "autonomous") -> ContinuationToken:
+        """Issue a continuation token pinned to the current monotonic fence_epoch."""
+        with self._fence_lock:
+            if self._halted:
+                raise RuntimeError(
+                    f"cannot issue continuation while human stop fence is active: {self._stop_reason}"
+                )
+            epoch = self._fence_epoch
+        return ContinuationToken(
+            fence_epoch=epoch,
+            issued_at_utc=utc_now_iso(),
+            label=label,
+        )
+
+    def raise_human_stop(self, actor_id: str, reason: str) -> int:
+        """Atomically advance fence_epoch and halt all pending autonomous continuations."""
+        if not actor_id or not actor_id.strip():
+            raise ValueError("actor_id must be non-empty")
+        if not reason or not reason.strip():
+            raise ValueError("reason must be non-empty")
+        with self._fence_lock:
+            self._fence_epoch += 1
+            self._halted = True
+            self._stop_reason = reason.strip()
+            self._stopped_by = actor_id.strip()
+            new_epoch = self._fence_epoch
+        if self.ledger is not None:
+            self.ledger.append(
+                "human_stop_fence",
+                actor_id.strip(),
+                {"fence_epoch": new_epoch, "reason": reason.strip()},
+                signing_key=self.signing_key,
+            )
+        return new_epoch
+
+    def clear_human_stop(self, actor_id: str, confirmation: str) -> int:
+        """Clear an active human stop with explicit confirmation and advance fence_epoch again.
+
+        Advancing fence_epoch on resume guarantees every pre-stop continuation
+        token remains permanently invalidated.
+        """
+        if not actor_id or not actor_id.strip():
+            raise ValueError("actor_id must be non-empty")
+        if not confirmation or len(confirmation.strip()) < 8:
+            raise ValueError("explicit human confirmation (at least 8 chars) is required to resume")
+        with self._fence_lock:
+            self._fence_epoch += 1
+            self._halted = False
+            self._stop_reason = None
+            self._stopped_by = None
+            new_epoch = self._fence_epoch
+        if self.ledger is not None:
+            self.ledger.append(
+                "human_stop_cleared",
+                actor_id.strip(),
+                {"fence_epoch": new_epoch, "confirmation_len": len(confirmation.strip())},
+                signing_key=self.signing_key,
+            )
+        return new_epoch
+
+    def check_continuation(self, token: ContinuationToken) -> tuple[bool, Optional[str]]:
+        """Check whether a continuation token is still live under the monotonic fence."""
+        with self._fence_lock:
+            if self._halted:
+                return False, f"human_stop_active:{self._stop_reason or 'unspecified'}"
+            if token.fence_epoch != self._fence_epoch:
+                return (
+                    False,
+                    f"stale_fence_epoch:token={token.fence_epoch},current={self._fence_epoch}",
+                )
+        return True, None
 
     def is_protected_path(self, raw_path: str) -> bool:
         norm = normalize_repo_path(raw_path)
@@ -552,9 +713,34 @@ class ApprovalGate:
         envelope: ActionEnvelope,
         *,
         approval: Optional[HumanApproval] = None,
+        continuation: Optional[ContinuationToken] = None,
         now_utc: Optional[str] = None,
     ) -> GateVerdict:
         """Evaluate an ActionEnvelope, returning allow, require_human_approval, or deny."""
+        # 0. Monotonic human stop / takeover fence beats all pending autonomous actions.
+        with self._fence_lock:
+            halted = self._halted
+            stop_reason = self._stop_reason
+            current_epoch = self._fence_epoch
+        if halted:
+            verdict = GateVerdict(
+                decision="deny",
+                risk_class="high_risk",
+                reasons=(f"human_stop_active:{stop_reason or 'unspecified'}",),
+            )
+            self._record("gate_human_stop_denied", envelope, verdict)
+            return verdict
+        if continuation is not None and continuation.fence_epoch != current_epoch:
+            verdict = GateVerdict(
+                decision="deny",
+                risk_class="high_risk",
+                reasons=(
+                    f"stale_fence_epoch:token={continuation.fence_epoch},current={current_epoch}",
+                ),
+            )
+            self._record("gate_stale_continuation_denied", envelope, verdict)
+            return verdict
+
         reasons: list[str] = []
 
         # 1. Normalize paths fail-closed (catches path traversal & decodes Git octal paths)
