@@ -147,6 +147,7 @@ def build_warp_adapter_bundle(
     scale: float = 1.0,
     scale_denominator: int = 1000,
     adapter_path: Optional[str] = None,
+    zone_manifest_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Construct a complete L3 warp-modeld AdapterBundle dict from L2 weft + L4 exo outputs."""
     manifest = _as_mapping(weft_manifest)
@@ -161,7 +162,7 @@ def build_warp_adapter_bundle(
     scale_num, scale_den = scale_to_rational(scale, denominator=scale_denominator)
     derivation_digest = _sha256_canonical(manifest)
 
-    return {
+    out: dict[str, Any] = {
         "adapter_id": str(adapter_id),
         "domain": str(domain),
         "llama_adapter_id": llama_id,
@@ -181,6 +182,9 @@ def build_warp_adapter_bundle(
         "derivation_digest": derivation_digest,
         "certificate": cert_dict,
     }
+    if zone_manifest_id is not None:
+        out["zone_manifest_id"] = str(zone_manifest_id)
+    return out
 
 
 def build_warp_bundles_for_route(
@@ -191,6 +195,7 @@ def build_warp_bundles_for_route(
     source_lineage: Mapping[str, Any],
     runtime_flags_sha256: str,
     scale_denominator: int = 1000,
+    zone_manifest_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Build warp-modeld AdapterBundle dicts for every non-zero domain in an exo RouteDecision.
 
@@ -203,6 +208,7 @@ def build_warp_bundles_for_route(
       - `gguf_sha256`: 64-hex SHA-256 of the compiled GGUF file
       - `adapter_path`: optional path string to the GGUF file on disk
     """
+    effective_zm = zone_manifest_id if zone_manifest_id is not None else decision.manifest_id
     bundles: list[dict[str, Any]] = []
     for entry in decision.lora_scales:
         domain = str(entry["id"])
@@ -226,6 +232,7 @@ def build_warp_bundles_for_route(
                 scale=scale,
                 scale_denominator=scale_denominator,
                 adapter_path=spec.get("adapter_path"),
+                zone_manifest_id=effective_zm,
             )
         )
     return bundles
