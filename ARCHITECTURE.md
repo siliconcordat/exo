@@ -70,7 +70,7 @@ Exo resolves these hazards deterministically in Layer 2 without letting weight s
 
 ### 2.5 L5 `mde` MCP client and L3 `warp-modeld` bridge (`src/exo/client.py`)
 
-- **L5 `mde` client:** Speaks JSON-RPC 2.0 over stdio or pluggable transport to invoke the five structural verbs (`splice_locate`, `splice_trace`, `splice_patch`, `splice_verify`, `splice_project`), enforcing that `splice_patch` never runs without valid session `read_tokens` and carrying vendor-namespaced `_meta` (`gg.moissanite/splice`, `gg.moissanite/mde`).
+- **L5 `mde` client:** Speaks JSON-RPC 2.0 over stdio or pluggable transport to invoke the five structural verbs (`splice_locate`, `splice_trace`, `splice_patch`, `splice_verify`, `splice_project`), enforcing that `splice_patch` never runs without valid session `read_tokens` and carrying vendor-namespaced `_meta` (`gg.siliconcordat/splice`, `gg.siliconcordat/mde`).
 - **L3 `warp-modeld` bridge:** Submits desired adapter scale vectors to L3 `warp-modeld`, verifies signed load receipts and active checkpoint digests before dispatching inference, and invokes `O(1)` adapter disable plus KV and recurrent-state flush whenever a gate fails.
 
 ## 3. Compliance with the Five Hard Vetoes

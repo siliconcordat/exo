@@ -319,20 +319,48 @@ def unwrap_command_argv(argv: Sequence[str]) -> tuple[list[str], list[str]]:
             continue
 
         if prog not in WRAPPER_SPECS:
-            # Check for `git` (handling global flags like `-C dir`, `-c k=v`) destructive subcommands
+            # Check for `git` config-injection, exec options, and destructive subcommands
             if prog == "git":
                 g_idx = idx + 1
                 while g_idx < n and argv[g_idx].startswith("-"):
                     gtok = argv[g_idx]
-                    if gtok in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+                    if gtok == "--":
+                        g_idx += 1
+                        break
+                    if gtok in ("-c", "--config-env"):
+                        reasons.append(f"git_config_injection:{gtok}")
+                        g_idx += 2
+                    elif gtok.startswith("--config-env=") or (gtok.startswith("-c") and len(gtok) > 2):
+                        reasons.append(f"git_config_injection:{gtok.split('=', 1)[0]}")
+                        g_idx += 1
+                    elif gtok in ("--exec-path", "--upload-pack", "--receive-pack"):
+                        reasons.append(f"git_exec_option:{gtok}")
+                        g_idx += 2
+                    elif gtok.startswith(("--exec-path=", "--upload-pack=", "--receive-pack=")):
+                        reasons.append(f"git_exec_option:{gtok.split('=', 1)[0]}")
+                        g_idx += 1
+                    elif gtok in ("-C", "--git-dir", "--work-tree", "--namespace"):
                         g_idx += 2
                     else:
                         g_idx += 1
                 if g_idx < n:
                     sub = argv[g_idx]
                     rest = argv[g_idx + 1 :]
-                    if sub == "push" and any(a in ("-f", "--force", "--force-with-lease") for a in rest):
-                        reasons.append("git_force_push")
+                    for a in rest:
+                        if a in ("--exec", "--receive-pack", "--upload-pack") or a.startswith(
+                            ("--exec=", "--receive-pack=", "--upload-pack=")
+                        ):
+                            reasons.append(f"git_exec_option:{a.split('=', 1)[0]}")
+                    if sub == "push":
+                        for a in rest:
+                            if a in ("-f", "--force", "--force-with-lease", "--force-if-includes"):
+                                reasons.append("git_force_push")
+                            elif a in ("-d", "--delete"):
+                                reasons.append("git_destructive:push_delete")
+                            elif not a.startswith("-") and a.startswith("+"):
+                                reasons.append(f"git_force_push_refspec:{a}")
+                            elif not a.startswith("-") and a.startswith(":"):
+                                reasons.append(f"git_delete_refspec:{a}")
                     elif sub in ("reset", "clean") and any(a in ("--hard", "-fd", "-fdx", "-f") for a in rest):
                         reasons.append(f"git_destructive:{sub}")
             # Check for `python` / `python3` inline code execution even after flags (`python3 -u -c ...`)

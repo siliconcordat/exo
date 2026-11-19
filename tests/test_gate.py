@@ -195,6 +195,25 @@ class TestApprovalGate(unittest.TestCase):
             self.assertEqual(verdict.decision, "deny", bad_spend)
             self.assertTrue(any("invalid_spend_usd" in r for r in verdict.reasons))
 
+    def test_git_config_injection_and_refspec_force_push_bypasses(self) -> None:
+        gate = ApprovalGate()
+        cases = [
+            (["git", "-c", "alias.x=!sh -c id", "x"], "git_config_injection:-c"),
+            (["git", "-c", "core.sshCommand=sh -c id", "fetch"], "git_config_injection:-c"),
+            (["git", "-ccore.fsmonitor=evil", "status"], "git_config_injection:-ccore.fsmonitor"),
+            (["git", "--config-env=core.sshCommand=EV", "fetch"], "git_config_injection:--config-env"),
+            (["git", "--config-env", "core.sshCommand=EV", "pull"], "git_config_injection:--config-env"),
+            (["git", "push", "origin", "+main"], "git_force_push_refspec:+main"),
+            (["git", "push", "origin", "+HEAD:refs/heads/main"], "git_force_push_refspec:+HEAD:refs/heads/main"),
+            (["git", "push", "origin", ":protected-branch"], "git_delete_refspec::protected-branch"),
+            (["git", "push", "--delete", "origin", "main"], "git_destructive:push_delete"),
+        ]
+        for argv, expected_reason in cases:
+            _, reasons = unwrap_command_argv(argv)
+            self.assertIn(expected_reason, reasons, f"missed {expected_reason} for {argv}: {reasons}")
+            verdict = gate.evaluate(ActionEnvelope(action_kind="tool_call", target="git", argv=tuple(argv)))
+            self.assertEqual(verdict.decision, "require_human_approval", argv)
+
 
 if __name__ == "__main__":
     unittest.main()

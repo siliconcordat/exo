@@ -35,22 +35,39 @@ class TestMdeClient(unittest.TestCase):
             name = req["params"]["name"]
             args = req["params"]["arguments"]
             if name == "splice_locate":
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req["id"],
-                    "result": {
-                        "path": args["path_or_symbol"],
-                        "zone": "code",
-                        "read_token": "tok-abc",
-                    },
+                payload = {
+                    "path": args["path"],
+                    "zone": "code",
+                    "file_read_token": "tok-abc",
                 }
-            if name == "splice_patch":
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req["id"],
-                    "result": {"packet_id": "pkt-001", "status": "spliced"},
+            elif name == "splice_trace":
+                payload = {
+                    "path": args["path"],
+                    "symbol": args.get("symbol"),
+                    "file_read_token": "tok-trace",
                 }
-            return {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}
+            elif name == "splice_patch":
+                payload = {"packet_id": "pkt-001", "status": "spliced", "edits_count": len(args["edits"])}
+            elif name == "splice_verify":
+                payload = {"bundle_id": "bnd-001", "packet_id": args["packet_id"], "eval_count": args.get("eval_count")}
+            elif name == "splice_project":
+                payload = {
+                    "packet_id": args["packet_id"],
+                    "bundle_id": args["bundle_id"],
+                    "approve_diff_sha256": args.get("approve_diff_sha256"),
+                    "status": "projected",
+                }
+            else:
+                payload = {"ok": True}
+            return {
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "structuredContent": payload,
+                    "isError": False,
+                },
+            }
 
         ledger = AppendOnlyLedger()
         gate = ApprovalGate(signing_key=b"client-key", ledger=ledger)
@@ -62,24 +79,38 @@ class TestMdeClient(unittest.TestCase):
             client.splice_patch(
                 capability_id="cap.math",
                 file_path="src/app/calc.py",
-                cst_edits=[{"byte_range": [0, 5], "new_bytes": "x = 2"}],
+                edits=[{"byte_range": [0, 5], "new_bytes": "x = 2"}],
                 seam_contract={"effects": []},
             )
         self.assertIn("ERR_PRECONDITION_READ_REQUIRED", str(ctx.exception))
         self.assertEqual(len(transport.sent_requests), 0)
 
-        # 2. After splice_locate, routine patch succeeds and carries vendor _meta
+        # 2. After splice_locate (structuredContent + file_read_token), routine patch succeeds
         loc = client.splice_locate("src/app/calc.py", capability_id="cap.math")
-        self.assertEqual(loc["read_token"], "tok-abc")
+        self.assertEqual(loc["file_read_token"], "tok-abc")
+        self.assertEqual(transport.sent_requests[-1]["params"]["arguments"]["path"], "src/app/calc.py")
+
+        tr = client.splice_trace("src/app/calc.py", symbol="calc")
+        self.assertEqual(tr["symbol"], "calc")
+
         res = client.splice_patch(
             capability_id="cap.math",
             file_path="src/app/calc.py",
-            cst_edits=[{"byte_range": [0, 5], "new_bytes": "x = 2"}],
+            edits=[{"byte_range": [0, 5], "new_bytes": "x = 2"}],
             seam_contract={"effects": []},
         )
         self.assertEqual(res["packet_id"], "pkt-001")
         patch_req = transport.sent_requests[-1]
+        self.assertEqual(SPLICE_META_KEY, "gg.siliconcordat/splice")
+        self.assertEqual(MDE_META_KEY, "gg.siliconcordat/mde")
         self.assertIn(SPLICE_META_KEY, patch_req["params"]["_meta"])
+        self.assertIn("edits", patch_req["params"]["arguments"])
+
+        ver = client.splice_verify("pkt-001", eval_count=2)
+        self.assertEqual(ver["bundle_id"], "bnd-001")
+        proj = client.splice_project("pkt-001", "bnd-001", approve_diff_sha256="deadbeef")
+        self.assertEqual(proj["status"], "projected")
+        self.assertEqual(proj["approve_diff_sha256"], "deadbeef")
 
         # 3. High-risk protected path requires exact-byte HumanApproval
         client.splice_locate("src/exo/gate/rules.py", capability_id="cap.gate")
@@ -89,7 +120,7 @@ class TestMdeClient(unittest.TestCase):
             client.splice_patch(
                 capability_id="cap.gate",
                 file_path="src/exo/gate/rules.py",
-                cst_edits=edits,
+                edits=edits,
                 seam_contract=seam,
             )
         self.assertIn("require_human_approval", str(ctx2.exception))
@@ -98,8 +129,9 @@ class TestMdeClient(unittest.TestCase):
         payload = canonical_json_bytes({
             "capability_id": "cap.gate",
             "file_path": "src/exo/gate/rules.py",
-            "cst_edits": edits,
+            "edits": edits,
             "seam_contract": seam,
+            "allow_oracle_write": False,
         })
         challenge = gate.evaluate(
             ActionEnvelope(
@@ -108,7 +140,7 @@ class TestMdeClient(unittest.TestCase):
                 paths=("src/exo/gate/rules.py",),
                 payload_bytes=payload,
                 read_tokens=("tok-abc",),
-                metadata={"capability_id": "cap.gate"},
+                metadata={"capability_id": "cap.gate", "allow_oracle_write": False},
             )
         ).challenge
         assert challenge is not None
@@ -116,11 +148,30 @@ class TestMdeClient(unittest.TestCase):
         res2 = client.splice_patch(
             capability_id="cap.gate",
             file_path="src/exo/gate/rules.py",
-            cst_edits=edits,
+            edits=edits,
             seam_contract=seam,
             approval=approval,
         )
         self.assertEqual(res2["status"], "spliced")
+
+    def test_mcp_is_error_true_raises_protocol_error(self) -> None:
+        def refusing_server(req: dict) -> dict:
+            err = {"code": "ERR_SYNTAX_ERROR_NODE", "message": "Refused splice inside ERROR subtree"}
+            return {
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(err)}],
+                    "structuredContent": err,
+                    "isError": True,
+                },
+            }
+
+        client = MdeClient(InMemoryJsonRpcTransport(refusing_server), actor_id="exo-test")
+        with self.assertRaises(MdeProtocolError) as ctx:
+            client.splice_locate("src/broken.py")
+        self.assertIn("isError=true", str(ctx.exception))
+        self.assertIn("ERR_SYNTAX_ERROR_NODE", str(ctx.exception))
 
     def test_stdio_jsonrpc_transport_against_live_subprocess(self) -> None:
         import sys
@@ -130,18 +181,19 @@ class TestMdeClient(unittest.TestCase):
             "for line in sys.stdin:\n"
             "  req = json.loads(line)\n"
             "  name = req['params']['name']\n"
-            "  res = {'path': 'src/app.py', 'zone': 'code', 'read_token': 'stdio-tok'} if name == 'splice_locate' else {'packet_id': 'pkt-stdio', 'status': 'spliced'}\n"
+            "  payload = {'path': 'src/app.py', 'zone': 'code', 'file_read_token': 'stdio-tok'} if name == 'splice_locate' else {'packet_id': 'pkt-stdio', 'status': 'spliced'}\n"
+            "  res = {'content': [{'type': 'text', 'text': json.dumps(payload)}], 'structuredContent': payload, 'isError': False}\n"
             "  sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': res}) + '\\n')\n"
             "  sys.stdout.flush()\n"
         )
         with StdioJsonRpcTransport([sys.executable, "-c", server_script]) as transport:
             client = MdeClient(transport, actor_id="exo-stdio-test")
             loc = client.splice_locate("src/app.py", capability_id="cap.stdio")
-            self.assertEqual(loc["read_token"], "stdio-tok")
+            self.assertEqual(loc["file_read_token"], "stdio-tok")
             patched = client.splice_patch(
                 capability_id="cap.stdio",
                 file_path="src/app.py",
-                cst_edits=[{"byte_range": [0, 1], "new_bytes": "a"}],
+                edits=[{"byte_range": [0, 1], "new_bytes": "a"}],
                 seam_contract={"effects": []},
             )
             self.assertEqual(patched["packet_id"], "pkt-stdio")

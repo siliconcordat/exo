@@ -13,8 +13,8 @@ from exo.gate import ActionEnvelope, ApprovalGate, HumanApproval, normalize_repo
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes
 from exo.router import RouteDecision
 
-SPLICE_META_KEY = "gg.moissanite/splice"
-MDE_META_KEY = "gg.moissanite/mde"
+SPLICE_META_KEY = "gg.siliconcordat/splice"
+MDE_META_KEY = "gg.siliconcordat/mde"
 
 
 class MdeProtocolError(Exception):
@@ -150,16 +150,32 @@ class MdeClient:
         result = response.get("result")
         if not isinstance(result, dict):
             raise MdeProtocolError(f"{tool_name} returned non-object result")
+        if result.get("isError") is True:
+            detail = result.get("structuredContent") or result.get("content") or result
+            raise MdeProtocolError(f"{tool_name} refused (isError=true): {detail}")
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
         return result
+
+    def _cache_read_token(self, payload: Mapping[str, Any], fallback_path: str) -> None:
+        token = payload.get("file_read_token") or payload.get("read_token")
+        path = payload.get("path") or fallback_path
+        if isinstance(token, str) and token:
+            try:
+                norm = normalize_repo_path(str(path))
+            except ValueError:
+                norm = str(path)
+            self._read_tokens[norm] = token
 
     def splice_locate(
         self,
-        path_or_symbol: str,
+        path: str,
         *,
         capability_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Locate CST span and syntactic zone tag; cache issued session read_token."""
-        args: dict[str, Any] = {"path_or_symbol": path_or_symbol}
+        args: dict[str, Any] = {"path": path}
         if capability_id is not None:
             args["capability_id"] = capability_id
         result = self._call_tool(
@@ -167,27 +183,20 @@ class MdeClient:
             args,
             splice_meta={"actor_id": self.actor_id, "capability_id": capability_id},
         )
-        token = result.get("read_token")
-        path = result.get("path") or path_or_symbol
-        if isinstance(token, str) and token:
-            try:
-                norm = normalize_repo_path(str(path))
-            except ValueError:
-                norm = str(path)
-            self._read_tokens[norm] = token
+        self._cache_read_token(result, path)
         return result
 
-    def splice_trace(self, symbol_or_span: str, base_tree: str) -> dict[str, Any]:
+    def splice_trace(self, path: str, *, symbol: Optional[str] = None) -> dict[str, Any]:
         """Trace static callers, capability peers, and unproven dynamic sites."""
+        args: dict[str, Any] = {"path": path}
+        if symbol is not None:
+            args["symbol"] = symbol
         result = self._call_tool(
             "splice_trace",
-            {"symbol_or_span": symbol_or_span, "base_tree": base_tree},
-            splice_meta={"actor_id": self.actor_id, "base_tree": base_tree},
+            args,
+            splice_meta={"actor_id": self.actor_id, "path": path},
         )
-        token = result.get("read_token")
-        path = result.get("path")
-        if isinstance(token, str) and token and isinstance(path, str):
-            self._read_tokens[normalize_repo_path(path)] = token
+        self._cache_read_token(result, path)
         return result
 
     def splice_patch(
@@ -195,8 +204,11 @@ class MdeClient:
         *,
         capability_id: str,
         file_path: str,
-        cst_edits: Sequence[Mapping[str, Any]],
-        seam_contract: Mapping[str, Any],
+        edits: Sequence[Mapping[str, Any]],
+        seam_contract: Optional[Mapping[str, Any]] = None,
+        commit_subject: Optional[str] = None,
+        summary_lines: Optional[Sequence[str]] = None,
+        allow_oracle_write: bool = False,
         approval: Optional[HumanApproval] = None,
         read_tokens: Optional[Sequence[str]] = None,
     ) -> dict[str, Any]:
@@ -213,8 +225,9 @@ class MdeClient:
         payload_bytes = canonical_json_bytes({
             "capability_id": capability_id,
             "file_path": norm_path,
-            "cst_edits": list(cst_edits),
-            "seam_contract": dict(seam_contract),
+            "edits": list(edits),
+            "seam_contract": dict(seam_contract or {}),
+            "allow_oracle_write": bool(allow_oracle_write),
         })
         envelope = ActionEnvelope(
             action_kind="splice_patch",
@@ -222,7 +235,7 @@ class MdeClient:
             paths=(norm_path,),
             payload_bytes=payload_bytes,
             read_tokens=tokens,
-            metadata={"capability_id": capability_id},
+            metadata={"capability_id": capability_id, "allow_oracle_write": bool(allow_oracle_write)},
         )
         verdict = self.gate.evaluate(envelope, approval=approval)
         if verdict.decision != "allow":
@@ -230,15 +243,20 @@ class MdeClient:
                 f"ApprovalGate blocked splice_patch ({verdict.decision}): {', '.join(verdict.reasons)}"
             )
 
+        args: dict[str, Any] = {
+            "capability_id": capability_id,
+            "read_tokens": list(tokens),
+            "edits": list(edits),
+            "allow_oracle_write": bool(allow_oracle_write),
+        }
+        if commit_subject is not None:
+            args["commit_subject"] = commit_subject
+        if summary_lines is not None:
+            args["summary_lines"] = list(summary_lines)
+
         return self._call_tool(
             "splice_patch",
-            {
-                "capability_id": capability_id,
-                "path": norm_path,
-                "read_tokens": list(tokens),
-                "cst_edits": list(cst_edits),
-                "seam_contract": dict(seam_contract),
-            },
+            args,
             splice_meta={
                 "actor_id": self.actor_id,
                 "capability_id": capability_id,
@@ -246,17 +264,29 @@ class MdeClient:
             },
         )
 
-    def splice_verify(self, packet_id: str, *, tier: str = "tier1") -> dict[str, Any]:
+    def splice_verify(self, packet_id: str, *, eval_count: Optional[int] = None) -> dict[str, Any]:
+        args: dict[str, Any] = {"packet_id": packet_id}
+        if eval_count is not None:
+            args["eval_count"] = int(eval_count)
         return self._call_tool(
             "splice_verify",
-            {"packet_id": packet_id, "tier": tier},
+            args,
             splice_meta={"actor_id": self.actor_id},
         )
 
-    def splice_project(self, packet_id: str, *, target_ref: str = "HEAD") -> dict[str, Any]:
+    def splice_project(
+        self,
+        packet_id: str,
+        bundle_id: str,
+        *,
+        approve_diff_sha256: Optional[str] = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {"packet_id": packet_id, "bundle_id": bundle_id}
+        if approve_diff_sha256 is not None:
+            args["approve_diff_sha256"] = approve_diff_sha256
         return self._call_tool(
             "splice_project",
-            {"packet_id": packet_id, "target_ref": target_ref},
+            args,
             splice_meta={"actor_id": self.actor_id},
         )
 
