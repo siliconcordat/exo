@@ -149,6 +149,7 @@ class TestZoneRouterAndPolicy(unittest.TestCase):
             )
         )
         self.assertEqual(research.scale_map(), {"corpus": 0.0, "weft-eido": 1.0, "formal-verification": 1.0})
+        self.assertTrue(research.constraints.forbid_float_in_exact_math)
         self.assertTrue(research.constraints.enforce_data_eido_skip)
         self.assertTrue(research.constraints.require_certificate_binding)
         self.assertTrue(research.constraints.require_illustrative_tag)
@@ -329,6 +330,20 @@ class TestZoneRouterAndPolicy(unittest.TestCase):
         self.assertEqual(fp_dec.l1_bank_tag, 3)
         self.assertTrue(fp_dec.constraints.enforce_data_eido_skip)
         self.assertTrue(fp_dec.constraints.forbid_float_in_exact_math)
+
+        # Fallback zones (research_page) still preserve manifest_id and forbid_float_in_exact_math
+        rp_dec = router.route(
+            RouteRequest(
+                zone="research_page",
+                active_domains=("corpus", "weft-eido", "formal-verification"),
+                repo_policy=foundation0_repo_policy(),
+                contains_formal_claims=True,
+                contains_certified_plot=True,
+                contains_illustrative_toy=True,
+            )
+        )
+        self.assertEqual(rp_dec.manifest_id, manifest["manifest_id"])
+        self.assertTrue(rp_dec.constraints.forbid_float_in_exact_math)
 
         # Hard Veto 2 still escalates on generic code with dual specialists
         with self.assertRaises(ContestedPreferenceError):

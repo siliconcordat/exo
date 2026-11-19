@@ -496,6 +496,7 @@ class ZoneRouter:
                 scales["corpus"] = 0.0  # specialist prose + UI govern; claim vocab stays locked
                 allow_negative_disclaimers = True
                 allow_exact_formal_notation = True
+                forbid_float_in_exact_math = True
                 enforce_data_eido_skip = True
                 require_certificate_binding = req.contains_certified_plot
                 require_illustrative_tag = req.contains_illustrative_toy
@@ -507,6 +508,7 @@ class ZoneRouter:
                 scales["formal-verification"] = 1.0
                 allow_negative_disclaimers = True
                 allow_exact_formal_notation = True
+                forbid_float_in_exact_math = True
                 require_certificate_binding = req.contains_certified_plot
                 rationale = "research_page zone: formal-verification active"
             elif "weft-eido" in active:
@@ -537,18 +539,22 @@ class ZoneRouter:
             lora_scales=ordered_scales,
             constraints=constraints,
             rationale=rationale,
+            manifest_id=self.manifest_id,
         )
         if self.ledger is not None:
+            ledger_payload: dict[str, Any] = {
+                "zone": req.zone,
+                "repo_id": req.repo_policy.repo_id,
+                "file_path": req.file_path,
+                "lora_scales": list(ordered_scales),
+                "enforce_data_eido_skip": constraints.enforce_data_eido_skip,
+                "claim_vocabulary": constraints.claim_vocabulary,
+            }
+            if self.manifest_id is not None:
+                ledger_payload["manifest_id"] = self.manifest_id
             self.ledger.append(
                 "mde_route_selected",
                 "exo-router",
-                {
-                    "zone": req.zone,
-                    "repo_id": req.repo_policy.repo_id,
-                    "file_path": req.file_path,
-                    "lora_scales": list(ordered_scales),
-                    "enforce_data_eido_skip": constraints.enforce_data_eido_skip,
-                    "claim_vocabulary": constraints.claim_vocabulary,
-                },
+                ledger_payload,
             )
         return decision

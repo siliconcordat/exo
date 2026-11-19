@@ -558,10 +558,13 @@ class WarpUnixBridge:
         bundles: Sequence[Mapping[str, Any]],
         *,
         composed_certificate: Optional[Mapping[str, Any]] = None,
+        zone_manifest_id: Optional[str] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"bundles": [dict(b) for b in bundles]}
         if composed_certificate is not None:
             params["composed_certificate"] = dict(composed_certificate)
+        if zone_manifest_id is not None:
+            params["zone_manifest_id"] = str(zone_manifest_id)
         result = self._rpc("wmcp_slot_mount", params)
         if self.ledger is not None:
             self.ledger.append(
@@ -572,7 +575,9 @@ class WarpUnixBridge:
                     "active_adapters": result.get("active_adapters"),
                     "slots_flushed": result.get("slots_flushed"),
                     "stage2_elapsed_ns": result.get("stage2_elapsed_ns"),
+                    "stage3_elapsed_ms": result.get("stage3_elapsed_ms"),
                     "canaries_passed": result.get("canaries_passed"),
+                    "zone_manifest_id": result.get("zone_manifest_id"),
                 },
             )
         return result
@@ -614,21 +619,69 @@ class WarpUnixBridge:
             self.ledger.append("warp_unix_lineage_update", self.actor_id, {"status": result.get("status")})
         return result
 
+    def update_zone_manifest(self, manifest_or_id: str | Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(manifest_or_id, Mapping):
+            params: dict[str, Any] = {"zone_manifest": dict(manifest_or_id)}
+        else:
+            params = {"zone_manifest_id": str(manifest_or_id)}
+        result = self._rpc("warp_update_zone_manifest", params)
+        if self.ledger is not None:
+            self.ledger.append(
+                "warp_unix_zone_manifest_update",
+                self.actor_id,
+                {
+                    "status": result.get("status"),
+                    "rollback_receipt": result.get("rollback_receipt"),
+                },
+            )
+        return result
+
     def infer(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         seed: int = 42,
         max_tokens: int = 256,
+        zone_manifest_id: Optional[str] = None,
         extra_params: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "messages": [dict(m) for m in messages],
             "temperature": float(temperature),
+            "top_p": float(top_p),
             "seed": int(seed),
             "max_tokens": int(max_tokens),
         }
+        if zone_manifest_id is not None:
+            params["zone_manifest_id"] = str(zone_manifest_id)
         if extra_params:
             params.update(extra_params)
         return self._rpc("warp_infer", params)
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+        n_predict: int = 64,
+        n_probs: int = 0,
+        zone_manifest_id: Optional[str] = None,
+        extra_params: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "prompt": str(prompt),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "seed": int(seed),
+            "n_predict": int(n_predict),
+            "n_probs": int(n_probs),
+        }
+        if zone_manifest_id is not None:
+            params["zone_manifest_id"] = str(zone_manifest_id)
+        if extra_params:
+            params.update(extra_params)
+        return self._rpc("warp_complete", params)
