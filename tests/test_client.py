@@ -419,7 +419,7 @@ class TestWarpUnixBridgeAndSchemaAdapter(unittest.TestCase):
         ckpt = translate_weft_checkpoint_to_warp(weft_manifest, model_id="Synthetic-W0")
         self.assertEqual(ckpt["weights_sha256"], "2" * 64)
         self.assertEqual(ckpt["chat_template_sha256"], "5" * 64)
-        self.assertEqual(scale_to_rational(0.75), (750, 1000))
+        self.assertEqual(scale_to_rational(0.75), (3, 4))
 
         decision = ZoneRouter().route(
             RouteRequest(
@@ -449,8 +449,8 @@ class TestWarpUnixBridgeAndSchemaAdapter(unittest.TestCase):
         )
         self.assertEqual(len(bundles), 1)
         self.assertEqual(bundles[0]["domain"], "corpus")
-        self.assertEqual(bundles[0]["scale_num"], 1000)
-        self.assertEqual(bundles[0]["scale_den"], 1000)
+        self.assertEqual(bundles[0]["scale_num"], 1)
+        self.assertEqual(bundles[0]["scale_den"], 1)
 
     def test_warp_unix_bridge_rpc_lifecycle_and_error_codes(self) -> None:
         class MockHandler(socketserver.StreamRequestHandler):
