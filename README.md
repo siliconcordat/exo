@@ -43,9 +43,9 @@ PYTHONPATH=src python3 -m exo check-policy --preset weft-eido --message "Fix lay
 
 ## Status and verification boundary
 
-The core stdlib kernel and offline test suite (38 tests) pass with zero external dependencies under both standard and `-O` optimized execution.
+The core stdlib kernel (`src/exo/`) and offline test suite (43 offline tests; 2 optional live tests skipped when sibling env vars are unset) import only the Python 3.10+ standard library (zero third-party dependencies, zero `numpy`) and pass under both standard and `-O` optimized execution. `examples/vertical_splice_demo.py` also uses zero `numpy` imports in `exo` itself, importing sibling `weft` and `warp_modeld` only when the optional live four-layer path is invoked.
 
-The live vertical stack tests (`tests/test_vertical_stack.py`, 2 tests) and `examples/vertical_splice_demo.py` pass end-to-end against compiled Rust `siliconcordat/mde` (including native `zone-manifest/v0.1` SHA-256 verification), `siliconcordat/weft` on synthetic Safetensors checkpoints, and `siliconcordat/warp` `warp-modeld` over Unix domain socket against `MockLlamaServer`. Live runs on 8B or 27B open-weights GPU checkpoints belong to Phase 3 in [PLAN.md](PLAN.md) and are not claimed here.
+The optional live vertical stack tests (`tests/test_vertical_stack.py`, 2 tests) and `examples/vertical_splice_demo.py` pass end-to-end against compiled Rust `siliconcordat/mde` (including native `zone-manifest/v0.1` SHA-256 verification), `siliconcordat/weft` on synthetic Safetensors checkpoints (note: sibling `weft` itself requires `numpy>=1.26`), and `siliconcordat/warp` `warp-modeld` over Unix domain socket against `MockLlamaServer`. Live runs on 8B or 27B open-weights GPU checkpoints belong to Phase 3 in [PLAN.md](PLAN.md) and are not claimed here.
 
 ## Documents
 

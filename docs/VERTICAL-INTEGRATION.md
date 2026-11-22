@@ -15,7 +15,9 @@ This suite does not run live 8B or 27B open-weights checkpoints on GPU hardware.
 
 ## How to run
 
-Core `exo` stays zero-dependency. Sibling binaries and source trees are discovered only through environment variables (`MDE_BIN` or `PATH`, `WARP_SRC`, `WEFT_SRC`, and optional `WARP_ROOT`).
+Core `exo` (`src/exo/`) and its offline test suite import only the Python 3.10+ standard library with zero third-party dependencies. `examples/vertical_splice_demo.py` also uses zero `numpy` or third-party imports in `exo` itself; it dynamically imports optional live sibling packages (`weft` and `warp_modeld`) from environment variables (`MDE_BIN` or `PATH`, `WARP_SRC`, `WEFT_SRC`, and optional `WARP_ROOT`) only when the live four-layer integration path is invoked.
+
+Note on sibling dependencies: when running the live four-layer suite with `WEFT_SRC` pointing to `siliconcordat/weft`, `weft` itself requires `numpy>=1.26` (per `weft/pyproject.toml`). Standalone offline `exo` tests require zero third-party packages.
 
 Standalone offline mode (env vars unset, vertical test skips cleanly):
 
@@ -43,19 +45,19 @@ PYTHONPATH=src python3 -B -W error examples/vertical_splice_demo.py
 
 ## Measured results
 
-Measured locally on macOS with Python 3.14 and compiled Rust `mde`:
+Standalone offline `unittest` (current pure-stdlib suite, zero third-party packages):
 
-- Standalone offline `unittest`: 40 tests discovered, 38 passed, 2 skipped cleanly under both `-B -W error` and `-O -B -W error`.
-- Live four-layer `unittest`: 40 tests discovered, 40 passed, 0 skipped under both `-B -W error` and `-O -B -W error` (`3.635s`, including live verification of `mde` `schemas/zone-manifest.v0.1.json` via `ZoneRouter.from_zone_manifest_file`).
-- Direct CLI run of `examples/vertical_splice_demo.py`: completed all five stages in `1509.46 ms`.
+- `PYTHONPATH=src python3 -B -W error -m unittest discover -s tests` and `-O -B`: `45` tests discovered, `43` passed, `2` skipped cleanly (including `5/5` zero-`numpy` stdlib vertical-demo tests in `tests/test_vertical_stack_stdlib.py`).
 
-| Stage | Layer | Verified behavior | Measured output |
+Baseline live four-layer run (recorded pre-Issue `#5` refactor on macOS with Python 3.14, compiled Rust `mde`, and `weft` + `numpy`; `40` tests = `38` offline + `2` live, `0` skipped in `3.635s`; direct CLI run `1509.46 ms`). Note: after Issue `#5`, synthetic `W_old`/`W_new` checkpoint matrices are generated deterministically via stdlib `random.Random(20261119)` rather than NumPy `default_rng`, so synthetic weight and GGUF digests change deterministically while preserving all four-layer verification invariants below:
+
+| Stage | Layer | Verified behavior | Baseline measured output |
 | --- | --- | --- | --- |
 | 1. CST locate and trace | L5 `mde` | Live Rust MCP parsed a mixed Python file, tagged four zones, and issued a session `file_read_token`. | Zones `code` (`60` bytes), `formal_proof` (`159` bytes), `prose` (`96` bytes), `ui_module` (`144` bytes). Symbol `compute_scale` traced cleanly. |
 | 2. Routing and approval gates | L4 `exo` + L5 `mde` | `ZoneRouter` mapped `prose -> corpus 1.0`, `formal_proof -> formal-verification 1.0`, `ui_module -> weft-eido 1.0`, and raised `ContestedPreferenceError` on generic `code` when both specialists were active. Both L4 `ApprovalGate` and L5 `mde` (`ERR_APPROVAL_REQUIRED`) blocked an unapproved write to `security/policy_gate.py` until exact-byte SHA-256 approvals were supplied. | `evidence_grade = canonical`, `oracle_tamper_free = true`, `secret_scan_passed = true`, `exo` ledger verified 17 entries with 0 errors. |
 | 3. Adapter compilation | L2 `weft` | Compiled three domain adapters (`corpus`, `weft-eido`, `formal-verification`) on synthetic Safetensors `W_old`, checked post-quantization F16 certificates, wrote deterministic GGUF v3 F16 binaries, and verified five-layer bindings. | GGUF sizes `672`, `672`, and `704` bytes. All three passed 0-byte re-derivation (`rederived_ok = true`). |
 | 4. Load gate, inference, and rollback | L3 `warp` | `WarpUnixBridge` mounted translated `weft` bundles over a `0o600` Unix socket. Stage 1 hashed on-disk `.gguf` binaries, Stage 2 checked integer certificates, Stage 3 ran five verifier-owned shadow canaries, and Stage 4 flushed slots `[0, 1]` before zone-routed inference. Raw `lora` override failed closed (`ERR_UNVERIFIED_LORA_OVERRIDE`). `warp_kill_switch` rolled back to clean base `W0`. | Stage 2 timings `11.3 us` to `21.0 us`. Active replies tagged `[ACTIVE_LORA:0]`, `[ACTIVE_LORA:2]`, `[ACTIVE_LORA:1]`. Kill switch took `2.41 ms`, returned `[BASE_W0]` with zero residual leak, and `LedgerVerifier` verified 4 of 4 HMAC receipts. |
-| 5. Checkpoint upgrade `W_old -> W_new` | L3 + L4 + L2 | Perturbed base weights (`W_old` `98fc7c99...` to `W_new` `0a4978dc...`). `warp-modeld` rejected the stale `W_old` bundle with `ERR_CHECKPOINT_MISMATCH`. `CrossGenerationPlanner` classified three SIM rules into `recompile`, `retire_candidate`, and `escalate_human`. `weft` recompiled `corpus` against `W_new` with a new GGUF digest (`c20b7471...` vs `7c7a9fc9...`) and mounted cleanly. | Recompiled `W_new` adapter passed 0-byte re-derivation, Stage 2 check (`16.2 us`), 5 shadow canaries, `[ACTIVE_LORA:0]` inference, and 2 of 2 HMAC ledger receipts. |
+| 5. Checkpoint upgrade `W_old -> W_new` | L3 + L4 + L2 | Perturbed base weights (`W_old` -> `W_new`, distinct `weights_sha256`). `warp-modeld` rejected the stale `W_old` bundle with `ERR_CHECKPOINT_MISMATCH`. `CrossGenerationPlanner` classified three SIM rules into `recompile`, `retire_candidate`, and `escalate_human`. `weft` recompiled `corpus` against `W_new` with a distinct GGUF digest and mounted cleanly. | Recompiled `W_new` adapter passed 0-byte re-derivation, Stage 2 check (`16.2 us`), 5 shadow canaries, `[ACTIVE_LORA:0]` inference, and 2 of 2 HMAC ledger receipts. |
 
 ## Cross-layer schema mismatches found
 
