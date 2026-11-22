@@ -19,7 +19,7 @@ from exo.policy import (
     weft_eido_repo_policy,
 )
 from exo.router import ContestedPreferenceError, RouteRequest, ZoneRouter
-from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMMemory
+from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMEvidenceError, SIMMemory
 
 PRESETS = {
     "corpus": corpus_repo_policy,
@@ -58,6 +58,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_up.add_argument("--new-sha", required=True)
     p_up.add_argument("--corpus-sha", required=True)
     p_up.add_argument("--probes", type=Path, default=None)
+    p_up.add_argument("--ledger", type=Path, default=None)
 
     args = parser.parse_args(argv)
 
@@ -109,26 +110,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if not violations else 1
 
     if args.cmd == "plan-upgrade":
-        sim = SIMMemory(args.sim_path)
-        probes: dict[str, BaselineProbe] = {}
-        if args.probes is not None:
-            raw_probes = json.loads(args.probes.read_text(encoding="utf-8"))
-            for item in raw_probes:
-                p = BaselineProbe(
-                    rule_id=str(item["rule_id"]),
-                    passed_natively=bool(item["passed_natively"]),
-                    regression_detected=bool(item.get("regression_detected", False)),
-                    peer_conflict=bool(item.get("peer_conflict", False)),
-                    notes=str(item.get("notes", "")),
-                )
-                probes[p.rule_id] = p
-        plan = CrossGenerationPlanner().plan_upgrade(
-            sim,
-            old_checkpoint_sha=args.old_sha,
-            new_checkpoint_sha=args.new_sha,
-            active_corpus_sha=args.corpus_sha,
-            probes=probes,
-        )
+        try:
+            ledger = AppendOnlyLedger(args.ledger) if args.ledger is not None else None
+            sim = SIMMemory(args.sim_path, ledger=ledger)
+            probes: dict[str, BaselineProbe] = {}
+            if args.probes is not None:
+                raw_probes = json.loads(args.probes.read_text(encoding="utf-8"))
+                if not isinstance(raw_probes, list):
+                    raise ValueError("probes file must contain a JSON array")
+                for item in raw_probes:
+                    p = BaselineProbe.from_dict(item)
+                    if p.rule_id in probes:
+                        raise ValueError(f"duplicate baseline probe for rule_id {p.rule_id!r}")
+                    probes[p.rule_id] = p
+            plan = CrossGenerationPlanner().plan_upgrade(
+                sim,
+                old_checkpoint_sha=args.old_sha,
+                new_checkpoint_sha=args.new_sha,
+                active_corpus_sha=args.corpus_sha,
+                probes=probes,
+                ledger=ledger,
+            )
+        except (SIMEvidenceError, ValueError, TypeError, KeyError, OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            return 1
         print(
             json.dumps(
                 {

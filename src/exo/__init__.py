@@ -59,7 +59,22 @@ from exo.router import (
     compute_zone_manifest_id,
     verify_zone_manifest,
 )
-from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMAttempt, SIMMemory, SIMRuleRecord, UpgradeAction, UpgradePlan
+from exo.sim import (
+    BASELINE_PROBE_RECEIPT_EVENT_TYPE,
+    EVALUATION_RECEIPT_EVENT_TYPE,
+    BaselineProbe,
+    CrossGenerationPlanner,
+    SIMAttempt,
+    SIMEvidenceError,
+    SIMMemory,
+    SIMRuleRecord,
+    UpgradeAction,
+    UpgradePlan,
+    record_baseline_probe_receipt,
+    record_evaluation_receipt,
+    verify_attempt_evidence,
+    verify_baseline_probe_evidence,
+)
 
 __all__ = [
     "ActionEnvelope",
@@ -67,6 +82,7 @@ __all__ = [
     "AppendOnlyLedger",
     "ApprovalChallenge",
     "ApprovalGate",
+    "BASELINE_PROBE_RECEIPT_EVENT_TYPE",
     "BaselineProbe",
     "CapabilityCharter",
     "CapabilityRegistry",
@@ -74,6 +90,7 @@ __all__ = [
     "ContinuationToken",
     "CrossGenerationPlanner",
     "DEFAULT_ALLOWED_TOOL_ENV_KEYS",
+    "EVALUATION_RECEIPT_EVENT_TYPE",
     "GateVerdict",
     "HumanApproval",
     "InMemoryJsonRpcTransport",
@@ -86,6 +103,7 @@ __all__ = [
     "RouteDecision",
     "RouteRequest",
     "SIMAttempt",
+    "SIMEvidenceError",
     "SIMMemory",
     "SIMRuleRecord",
     "StdioJsonRpcTransport",
@@ -107,6 +125,8 @@ __all__ = [
     "foundation0_repo_policy",
     "normalize_repo_path",
     "proven_commons_repo_policy",
+    "record_baseline_probe_receipt",
+    "record_evaluation_receipt",
     "redact_secrets_in_text",
     "redact_secrets_in_value",
     "scale_to_rational",
@@ -117,6 +137,8 @@ __all__ = [
     "translate_weft_checkpoint_to_warp",
     "unwrap_command_argv",
     "validate_change_against_policy",
+    "verify_attempt_evidence",
+    "verify_baseline_probe_evidence",
     "verify_zone_manifest",
     "weft_eido_repo_policy",
 ]
