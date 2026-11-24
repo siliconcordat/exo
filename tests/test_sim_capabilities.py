@@ -8,7 +8,15 @@ import unittest
 
 from exo.capabilities import AdaptationProposal, CapabilityCharter, CapabilityRegistry, PeerResponse
 from exo.ledger import AppendOnlyLedger
-from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMAttempt, SIMMemory, SIMRuleRecord
+from exo.sim import (
+    BaselineProbe,
+    CrossGenerationPlanner,
+    SIMAttempt,
+    SIMMemory,
+    SIMRuleRecord,
+    record_baseline_probe_receipt,
+    record_evaluation_receipt,
+)
 
 
 class TestCapabilitiesAndSIM(unittest.TestCase):
@@ -93,6 +101,14 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                     corpus_sha="corpus-sha-1",
                 )
             )
+            clean_eval = record_evaluation_receipt(
+                ledger,
+                rule_id="rule.clean-writing",
+                round_id=1,
+                outcome="improved",
+                base_checkpoint_sha="ckpt-old",
+                corpus_sha="corpus-sha-1",
+            )
             sim.record_attempt(
                 "rule.clean-writing",
                 SIMAttempt(
@@ -104,6 +120,7 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                     base_checkpoint_sha="ckpt-old",
                     corpus_sha="corpus-sha-1",
                     outcome="improved",
+                    evidence_receipt_sha256=clean_eval.entry_sha256,
                 ),
             )
 
@@ -165,9 +182,38 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                 )
             )
 
-            # Reload from append-only disk journal
-            reloaded = SIMMemory(sim_path)
+            # Reload from append-only disk journal with backing ledger
+            reloaded = SIMMemory(sim_path, ledger=ledger)
             self.assertEqual(len(reloaded.get("rule.clean-writing").attempts), 1)
+            self.assertEqual(
+                reloaded.get("rule.clean-writing").attempts[0].evidence_receipt_sha256,
+                clean_eval.entry_sha256,
+            )
+
+            xml_probe = record_baseline_probe_receipt(
+                ledger,
+                rule_id="rule.xml-eos-fix",
+                checkpoint_sha="ckpt-new",
+                passed_natively=True,
+                bare_model=True,
+                observed_corpus_sha="corpus-sha-1",
+            )
+            omega_probe = record_baseline_probe_receipt(
+                ledger,
+                rule_id="rule.lean-omega-guard",
+                checkpoint_sha="ckpt-new",
+                passed_natively=False,
+                bare_model=True,
+                observed_corpus_sha="corpus-sha-1",
+            )
+            prose_probe = record_baseline_probe_receipt(
+                ledger,
+                rule_id="rule.clean-writing",
+                checkpoint_sha="ckpt-new",
+                passed_natively=True,
+                bare_model=True,
+                observed_corpus_sha="corpus-sha-1",
+            )
 
             planner = CrossGenerationPlanner()
             plan = planner.plan_upgrade(
@@ -176,10 +222,26 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                 new_checkpoint_sha="ckpt-new",
                 active_corpus_sha="corpus-sha-1",
                 probes={
-                    "rule.xml-eos-fix": BaselineProbe("rule.xml-eos-fix", passed_natively=True),
-                    "rule.lean-omega-guard": BaselineProbe("rule.lean-omega-guard", passed_natively=False),
-                    "rule.clean-writing": BaselineProbe("rule.clean-writing", passed_natively=True),
+                    "rule.xml-eos-fix": BaselineProbe(
+                        "rule.xml-eos-fix",
+                        passed_natively=True,
+                        observed_corpus_sha="corpus-sha-1",
+                        evidence_receipt_sha256=xml_probe.entry_sha256,
+                    ),
+                    "rule.lean-omega-guard": BaselineProbe(
+                        "rule.lean-omega-guard",
+                        passed_natively=False,
+                        observed_corpus_sha="corpus-sha-1",
+                        evidence_receipt_sha256=omega_probe.entry_sha256,
+                    ),
+                    "rule.clean-writing": BaselineProbe(
+                        "rule.clean-writing",
+                        passed_natively=True,
+                        observed_corpus_sha="corpus-sha-1",
+                        evidence_receipt_sha256=prose_probe.entry_sha256,
+                    ),
                 },
+                ledger=ledger,
             )
 
             by_id = {a.rule_id: a for a in plan.actions}
@@ -209,6 +271,14 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                     corpus_sha="b" * 64,
                 )
             )
+            secret_eval = record_evaluation_receipt(
+                ledger,
+                rule_id="rule.secret-test",
+                round_id=1,
+                outcome="improved",
+                base_checkpoint_sha="a" * 64,
+                corpus_sha="b" * 64,
+            )
             att = sim.record_attempt(
                 "rule.secret-test",
                 SIMAttempt(
@@ -220,6 +290,7 @@ class TestCapabilitiesAndSIM(unittest.TestCase):
                     base_checkpoint_sha="a" * 64,
                     corpus_sha="b" * 64,
                     outcome="improved",
+                    evidence_receipt_sha256=secret_eval.entry_sha256,
                 ),
             )
             raw_journal = sim_path.read_text(encoding="utf-8")

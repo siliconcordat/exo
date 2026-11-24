@@ -57,7 +57,15 @@ from exo.gate import ActionEnvelope, ApprovalGate
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes
 from exo.policy import siliconcordat_repo_policy
 from exo.router import ContestedPreferenceError, RouteDecision, RouteRequest, ZoneRouter
-from exo.sim import BaselineProbe, CrossGenerationPlanner, SIMAttempt, SIMMemory, SIMRuleRecord
+from exo.sim import (
+    BaselineProbe,
+    CrossGenerationPlanner,
+    SIMAttempt,
+    SIMMemory,
+    SIMRuleRecord,
+    record_baseline_probe_receipt,
+    record_evaluation_receipt,
+)
 
 DOMAIN_TO_LLAMA_ID = {
     "corpus": 0,
@@ -846,6 +854,15 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
                     corpus_sha=corpus_tree_sha,
                 )
             )
+            eval_receipt = record_evaluation_receipt(
+                exo_ledger,
+                rule_id="rule.corpus.plain_prose",
+                round_id=1,
+                outcome="improved",
+                base_checkpoint_sha=w_old_sha,
+                corpus_sha=corpus_tree_sha,
+                details={"evidence_bundle_id": evidence["bundle_id"]},
+            )
             sim.record_attempt(
                 "rule.corpus.plain_prose",
                 SIMAttempt(
@@ -859,6 +876,7 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
                     outcome="improved",
                     files=("security/policy_gate.py",),
                     domain="corpus",
+                    evidence_receipt_sha256=eval_receipt.entry_sha256,
                 ),
             )
             sim.register_rule(
@@ -887,6 +905,15 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
                     contested_reason="two teams disagree on condensed vs verbose reports",
                 )
             )
+            eos_probe_receipt = record_baseline_probe_receipt(
+                exo_ledger,
+                rule_id="rule.old.eos_guard",
+                checkpoint_sha=w_new_sha,
+                passed_natively=True,
+                bare_model=True,
+                observed_corpus_sha=corpus_tree_sha,
+                notes="W_new emits complete tool JSON natively.",
+            )
             upgrade_plan = CrossGenerationPlanner().plan_upgrade(
                 sim,
                 old_checkpoint_sha=w_old_sha,
@@ -896,9 +923,12 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
                     "rule.old.eos_guard": BaselineProbe(
                         rule_id="rule.old.eos_guard",
                         passed_natively=True,
+                        observed_corpus_sha=corpus_tree_sha,
                         notes="W_new emits complete tool JSON natively.",
+                        evidence_receipt_sha256=eos_probe_receipt.entry_sha256,
                     )
                 },
+                ledger=exo_ledger,
             )
             plan_by_rule = {a.rule_id: a.action for a in upgrade_plan.actions}
 

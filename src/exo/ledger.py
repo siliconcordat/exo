@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional
 
 GENESIS_HASH = "0" * 64
 REDACTED_PLACEHOLDER = "[REDACTED]"
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Pre-JSON raw-string secret patterns (applied BEFORE json.dumps escaping so
 # multiline PEM private keys and quoted secrets cannot slip past JSON escaping).
@@ -137,16 +138,48 @@ class LedgerEntry:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "LedgerEntry":
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"ledger entry must be a mapping (got {type(raw).__name__})")
+        required = (
+            "seq",
+            "timestamp_utc",
+            "event_type",
+            "actor_id",
+            "payload",
+            "prev_sha256",
+            "entry_sha256",
+        )
+        missing = [k for k in required if k not in raw]
+        if missing:
+            raise ValueError(f"ledger entry missing required field(s): {', '.join(missing)}")
+        raw_seq = raw["seq"]
+        if type(raw_seq) is not int or raw_seq < 1:
+            raise ValueError(f"ledger entry seq must be a positive int (got {raw_seq!r})")
+        raw_payload = raw["payload"]
+        if not isinstance(raw_payload, dict):
+            raise ValueError(f"ledger entry payload must be a dict (got {type(raw_payload).__name__})")
+        for key in ("timestamp_utc", "event_type", "actor_id", "prev_sha256", "entry_sha256"):
+            if type(raw[key]) is not str:
+                raise ValueError(f"ledger entry {key} must be a string (got {type(raw[key]).__name__})")
+        if (
+            _SHA256_HEX_RE.fullmatch(raw["entry_sha256"]) is None
+            or _SHA256_HEX_RE.fullmatch(raw["prev_sha256"]) is None
+        ):
+            raise ValueError("ledger entry digests must be 64-character lowercase hex SHA-256 strings")
+        sig_kind = raw.get("signature_kind", "unsigned")
+        sig = raw.get("signature")
+        if type(sig_kind) is not str or (sig is not None and (type(sig) is not str or not sig.isascii())):
+            raise ValueError("ledger entry signature metadata must be ASCII strings")
         return cls(
-            seq=int(raw["seq"]),
-            timestamp_utc=str(raw["timestamp_utc"]),
-            event_type=str(raw["event_type"]),
-            actor_id=str(raw["actor_id"]),
-            payload=dict(raw["payload"]),
-            prev_sha256=str(raw["prev_sha256"]),
-            entry_sha256=str(raw["entry_sha256"]),
-            signature_kind=str(raw.get("signature_kind", "unsigned")),
-            signature=raw.get("signature"),
+            seq=raw_seq,
+            timestamp_utc=raw["timestamp_utc"],
+            event_type=raw["event_type"],
+            actor_id=raw["actor_id"],
+            payload=dict(raw_payload),
+            prev_sha256=raw["prev_sha256"],
+            entry_sha256=raw["entry_sha256"],
+            signature_kind=sig_kind,
+            signature=sig,
         )
 
 
@@ -163,7 +196,10 @@ class AppendOnlyLedger:
         if self.path is None:
             raise RuntimeError("cannot load ledger from disk when path is None")
         loaded: list[LedgerEntry] = []
-        raw_text = self.path.read_text(encoding="utf-8")
+        try:
+            raw_text = self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
         for line_no, line in enumerate(raw_text.splitlines(), 1):
             if not line.strip():
                 continue
@@ -286,3 +322,57 @@ class AppendOnlyLedger:
                         errors.append(f"entry {idx}: invalid hmac-sha256 signature")
             expected_prev = entry.entry_sha256
         return errors
+
+    def verified_entries(
+        self,
+        *,
+        event_type: Optional[str] = None,
+        signing_key: Optional[bytes] = None,
+        require_signatures: bool = False,
+        require_file: bool = False,
+    ) -> list[LedgerEntry]:
+        """Verify full hash-chain integrity and return verified entries."""
+        errors = self.verify_chain(
+            signing_key=signing_key,
+            require_signatures=require_signatures,
+        )
+        if errors:
+            raise ValueError(f"ledger verification failed: {errors[0]}")
+        if self.path is not None:
+            if not self.path.exists():
+                if require_file or self._entries:
+                    raise ValueError(f"ledger file does not exist: {self.path}")
+                records: list[LedgerEntry] = []
+            else:
+                records = self._load_from_disk()
+        else:
+            records = list(self._entries)
+        if event_type is None:
+            return records
+        return [e for e in records if e.event_type == event_type]
+
+    def resolve_verified_entry(
+        self,
+        entry_sha256: str,
+        *,
+        expected_event_type: Optional[str] = None,
+        signing_key: Optional[bytes] = None,
+        require_signatures: bool = False,
+    ) -> LedgerEntry:
+        """Verify full chain integrity and resolve one entry by exact entry_sha256."""
+        if type(entry_sha256) is not str or _SHA256_HEX_RE.fullmatch(entry_sha256) is None:
+            raise ValueError("entry_sha256 must be a 64-character lowercase hex SHA-256 digest")
+        records = self.verified_entries(
+            signing_key=signing_key,
+            require_signatures=require_signatures,
+            require_file=True,
+        )
+        for entry in records:
+            if hmac.compare_digest(entry.entry_sha256, entry_sha256):
+                if expected_event_type is not None and entry.event_type != expected_event_type:
+                    raise ValueError(
+                        f"ledger receipt {entry_sha256} has event_type {entry.event_type!r}, "
+                        f"expected {expected_event_type!r}"
+                    )
+                return entry
+        raise ValueError(f"ledger receipt digest not found: {entry_sha256}")

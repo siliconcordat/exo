@@ -36,7 +36,7 @@ from exo.gate import ActionEnvelope, ApprovalGate
 from exo.ledger import AppendOnlyLedger, canonical_json_bytes
 from exo.policy import corpus_repo_policy, siliconcordat_repo_policy
 from exo.router import RouteRequest, ZoneRouter
-from exo.sim import SIMMemory, SIMRuleRecord
+from exo.sim import SIMMemory, SIMRuleRecord, record_baseline_probe_receipt
 
 
 class TestMdeClient(unittest.TestCase):
@@ -339,8 +339,10 @@ class TestExoCli(unittest.TestCase):
             self.assertTrue(json.loads(buf3.getvalue())["ok"])
 
             sim_path = Path(tmp) / "sim.jsonl"
+            sim_ledger_path = Path(tmp) / "sim-ledger.jsonl"
             probes_path = Path(tmp) / "probes.json"
-            sim = SIMMemory(sim_path)
+            sim_ledger = AppendOnlyLedger(sim_ledger_path)
+            sim = SIMMemory(sim_path, ledger=sim_ledger)
             sim.register_rule(
                 SIMRuleRecord(
                     rule_id="rule.eos",
@@ -353,8 +355,23 @@ class TestExoCli(unittest.TestCase):
                     corpus_sha="c1",
                 )
             )
+            eos_probe_entry = record_baseline_probe_receipt(
+                sim_ledger,
+                rule_id="rule.eos",
+                checkpoint_sha="new",
+                passed_natively=True,
+                bare_model=True,
+                observed_corpus_sha="c1",
+            )
             probes_path.write_text(
-                json.dumps([{"rule_id": "rule.eos", "passed_natively": True}]),
+                json.dumps([
+                    {
+                        "rule_id": "rule.eos",
+                        "passed_natively": True,
+                        "observed_corpus_sha": "c1",
+                        "evidence_receipt_sha256": eos_probe_entry.entry_sha256,
+                    }
+                ]),
                 encoding="utf-8",
             )
             buf4 = io.StringIO()
@@ -370,10 +387,30 @@ class TestExoCli(unittest.TestCase):
                     "c1",
                     "--probes",
                     str(probes_path),
+                    "--ledger",
+                    str(sim_ledger_path),
                 ])
             self.assertEqual(rc4, 0)
             plan_out = json.loads(buf4.getvalue())
             self.assertEqual(plan_out["actions"][0]["action"], "retire_candidate")
+
+            # Without --ledger, plan-upgrade must fail closed rather than retire on caller's word
+            buf5 = io.StringIO()
+            with redirect_stdout(buf5):
+                rc5 = cli_main([
+                    "plan-upgrade",
+                    str(sim_path),
+                    "--old-sha",
+                    "old",
+                    "--new-sha",
+                    "new",
+                    "--corpus-sha",
+                    "c1",
+                    "--probes",
+                    str(probes_path),
+                ])
+            self.assertEqual(rc5, 1)
+            self.assertFalse(json.loads(buf5.getvalue())["ok"])
 
 
 class TestWarpUnixBridgeAndSchemaAdapter(unittest.TestCase):
