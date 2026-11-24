@@ -24,15 +24,17 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import random
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 # Allow direct invocation without manually setting PYTHONPATH=src when run from repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -126,26 +128,145 @@ def discover_siblings() -> tuple[Optional[SiblingEnvironment], list[str]]:
     )
 
 
+def _f32(value: float) -> float:
+    """Round a finite float to IEEE-754 binary32 precision using stdlib struct."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _require_finite_real(value: Any, name: str) -> float:
+    """Require an exact finite int or float (rejecting bool, NaN, Inf, and int overflow)."""
+    if type(value) not in (int, float):
+        raise TypeError(f"{name} must be an exact int or float (got {type(value).__name__})")
+    try:
+        val = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} overflows IEEE-754 float64") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"{name} must be finite (got {value!r})")
+    return val
+
+
+def _require_positive_dim(value: Any, name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an exact int (got {type(value).__name__})")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive (got {value})")
+    return value
+
+
+class _Matrix2D(list):
+    """Minimal pure-stdlib 2D float matrix compatible with sibling NumPy coercion."""
+
+    def __init__(self, rows: Sequence[Sequence[Any]]) -> None:
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence) or len(rows) == 0:
+            raise ValueError("matrix must be a non-empty 2D sequence")
+        parsed: list[list[float]] = []
+        expected_cols: Optional[int] = None
+        for r_idx, row in enumerate(rows):
+            if isinstance(row, (str, bytes)) or not isinstance(row, Sequence) or len(row) == 0:
+                raise ValueError(f"matrix row {r_idx} must be a non-empty sequence")
+            if expected_cols is None:
+                expected_cols = len(row)
+            elif len(row) != expected_cols:
+                raise ValueError(f"ragged matrix row {r_idx}: expected {expected_cols} cols, got {len(row)}")
+            parsed.append([_require_finite_real(v, f"matrix[{r_idx}][{c_idx}]") for c_idx, v in enumerate(row)])
+        super().__init__(parsed)
+        self._cols = expected_cols if expected_cols is not None else 0
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (len(self), self._cols)
+
+    @property
+    def size(self) -> int:
+        return len(self) * self._cols
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    def copy(self) -> "_Matrix2D":
+        return _Matrix2D([list(row) for row in self])
+
+    def to_f32(self) -> "_Matrix2D":
+        return _Matrix2D([[_f32(v) for v in row] for row in self])
+
+    def to_f32_bytes(self) -> bytes:
+        flat = [v for row in self for v in row]
+        return struct.pack(f"<{len(flat)}f", *flat)
+
+
+def _rand_normal_matrix(rng: random.Random, rows: int, cols: int, *, scale: float = 1.0) -> _Matrix2D:
+    n_rows = _require_positive_dim(rows, "rows")
+    n_cols = _require_positive_dim(cols, "cols")
+    s = _require_finite_real(scale, "scale")
+    return _Matrix2D([[rng.gauss(0.0, 1.0) * s for _ in range(n_cols)] for _ in range(n_rows)])
+
+
+def _ones_matrix(rows: int, cols: int) -> _Matrix2D:
+    n_rows = _require_positive_dim(rows, "rows")
+    n_cols = _require_positive_dim(cols, "cols")
+    return _Matrix2D([[1.0] * n_cols for _ in range(n_rows)])
+
+
+def _matmul_2d(a: _Matrix2D, b: _Matrix2D) -> _Matrix2D:
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(f"matmul shape mismatch: {a.shape} @ {b.shape}")
+    rows_a, inner = a.shape
+    cols_b = b.shape[1]
+    b_cols = [[b[k][j] for k in range(inner)] for j in range(cols_b)]
+    return _Matrix2D(
+        [
+            [math.fsum(a[i][k] * b_cols[j][k] for k in range(inner)) for j in range(cols_b)]
+            for i in range(rows_a)
+        ]
+    )
+
+
+def _add_2d(a: _Matrix2D, b: _Matrix2D) -> _Matrix2D:
+    if a.shape != b.shape:
+        raise ValueError(f"matrix addition shape mismatch: {a.shape} + {b.shape}")
+    rows, cols = a.shape
+    return _Matrix2D([[a[i][j] + b[i][j] for j in range(cols)] for i in range(rows)])
+
+
+def _scale_2d(a: _Matrix2D, factor: float) -> _Matrix2D:
+    f = _require_finite_real(factor, "factor")
+    return _Matrix2D([[v * f for v in row] for row in a])
+
+
+def _frobenius_norm_2d(a: _Matrix2D) -> float:
+    return math.sqrt(math.fsum(v * v for row in a for v in row))
+
+
 def _load_sibling_modules(env: SiblingEnvironment) -> dict[str, Any]:
-    """Import weft, warp_modeld, and MockLlamaServer without shadowing exo/tests."""
+    """Import weft, warp_modeld, and MockLlamaServer without importing numpy in exo."""
     for p in (str(env.weft_src), str(env.warp_src)):
         if p not in sys.path:
             sys.path.append(p)
 
-    import numpy as np  # type: ignore[import-not-found]
-    from weft.binding import (  # type: ignore[import-not-found]
-        ADAPTER_CLASS_1,
-        RuntimeFlags as WeftRuntimeFlags,
-        build_binding_manifest,
-        verify_binding,
-    )
-    from weft.certificate import GatePolicy  # type: ignore[import-not-found]
-    from weft.compiler import (  # type: ignore[import-not-found]
-        BetaEditConfig,
-        BetaEditNullspaceProjector,
-        verify_rederivation,
-    )
-    from weft.gguf_lora import read_gguf_lora, write_gguf_lora  # type: ignore[import-not-found]
+    try:
+        from weft.binding import (  # type: ignore[import-not-found]
+            ADAPTER_CLASS_1,
+            RuntimeFlags as WeftRuntimeFlags,
+            build_binding_manifest,
+            verify_binding,
+        )
+        from weft.certificate import GatePolicy  # type: ignore[import-not-found]
+        from weft.compiler import (  # type: ignore[import-not-found]
+            BetaEditConfig,
+            BetaEditNullspaceProjector,
+            verify_rederivation,
+        )
+        from weft.gguf_lora import read_gguf_lora, write_gguf_lora  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name != "weft":
+            raise ModuleNotFoundError(
+                f"Sibling package 'weft' requires third-party dependency {exc.name!r} "
+                f"(core exo uses only the Python standard library): {exc}",
+                name=exc.name,
+            ) from exc
+        raise
     from warp_modeld.canary import CanarySuite  # type: ignore[import-not-found]
     from warp_modeld.certificate import CertificateBounds, RationalBound  # type: ignore[import-not-found]
     from warp_modeld.fingerprint import (  # type: ignore[import-not-found]
@@ -167,7 +288,6 @@ def _load_sibling_modules(env: SiblingEnvironment) -> dict[str, Any]:
     spec.loader.exec_module(mock_mod)
 
     return {
-        "np": np,
         "ADAPTER_CLASS_1": ADAPTER_CLASS_1,
         "WeftRuntimeFlags": WeftRuntimeFlags,
         "build_binding_manifest": build_binding_manifest,
@@ -194,16 +314,17 @@ def _load_sibling_modules(env: SiblingEnvironment) -> dict[str, Any]:
     }
 
 
-def _write_synthetic_safetensors(path: Path, tensors: dict[str, Any], np: Any) -> None:
-    """Write a valid Safetensors binary from float32 NumPy arrays."""
+def _write_synthetic_safetensors(path: Path, tensors: Mapping[str, _Matrix2D]) -> None:
+    """Write a valid Safetensors binary from pure-stdlib float32 matrices."""
     header: dict[str, Any] = {}
     blobs: list[bytes] = []
     offset = 0
     for name, arr in sorted(tensors.items()):
-        raw = np.ascontiguousarray(arr, dtype="<f4").tobytes()
+        mat = arr if isinstance(arr, _Matrix2D) else _Matrix2D(arr)
+        raw = mat.to_f32_bytes()
         header[name] = {
             "dtype": "F32",
-            "shape": list(arr.shape),
+            "shape": list(mat.shape),
             "data_offsets": [offset, offset + len(raw)],
         }
         blobs.append(raw)
@@ -216,15 +337,14 @@ def _write_synthetic_safetensors(path: Path, tensors: dict[str, Any], np: Any) -
             fh.write(blob)
 
 
-def _create_synthetic_checkpoint(ckpt_dir: Path, base_weight: Any, np: Any, *, tag: str) -> Path:
+def _create_synthetic_checkpoint(ckpt_dir: Path, base_weight: _Matrix2D, *, tag: str) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     _write_synthetic_safetensors(
         ckpt_dir / "model.safetensors",
         {
-            "blk.0.ffn_down.weight": base_weight.astype(np.float32),
-            "embed_tokens.weight": np.ones((8, base_weight.shape[1]), dtype=np.float32),
+            "blk.0.ffn_down.weight": base_weight.to_f32(),
+            "embed_tokens.weight": _ones_matrix(8, base_weight.shape[1]),
         },
-        np,
     )
     (ckpt_dir / "config.json").write_text(
         json.dumps({"hidden_size": int(base_weight.shape[1]), "checkpoint_tag": tag}) + "\n",
@@ -296,26 +416,25 @@ def _compile_domain_adapter(
     reference_base_weight: Any = None,
 ) -> dict[str, Any]:
     """Compile one deterministic L2 weft adapter + certificate + 5-layer binding + GGUF."""
-    np = mods["np"]
     d_out, d_in = int(base_weight.shape[0]), int(base_weight.shape[1])
-    rng = np.random.default_rng(seed)
+    rng = random.Random(seed)
 
     # Low-rank anchor covariance K0 so the null space is well-conditioned and exact.
-    k0 = rng.standard_normal((d_in, 8)) * 0.25
+    k0 = _rand_normal_matrix(rng, d_in, 8, scale=0.25)
     # Register-scoped y=0 preservation keys (non-overlapping register).
-    pres_keys = rng.standard_normal((d_in, 2)) * 0.1
+    pres_keys = _rand_normal_matrix(rng, d_in, 2, scale=0.1)
     # Edit keys and small residual targets so post-quant F16 bounds remain tight.
-    edit_keys = rng.standard_normal((d_in, 2)) * 0.35
-    residuals = rng.standard_normal((d_out, 2)) * 0.08
+    edit_keys = _rand_normal_matrix(rng, d_in, 2, scale=0.35)
+    residuals = _rand_normal_matrix(rng, d_out, 2, scale=0.08)
     # Express target values V = W_ref @ K + residuals so changing W0 changes the compiled factors.
     w_ref = base_weight if reference_base_weight is None else reference_base_weight
-    target_values = np.asarray(w_ref, dtype=np.float64) @ edit_keys + residuals
+    target_values = _add_2d(_matmul_2d(w_ref, edit_keys), residuals)
 
     # Unit-normalized safety direction to verify orthogonal preservation.
-    b_s = rng.standard_normal((d_out, 1))
-    a_s = rng.standard_normal((1, d_in))
-    s_norm = float(np.linalg.norm(b_s @ a_s, ord="fro"))
-    b_s = b_s / s_norm
+    b_s = _rand_normal_matrix(rng, d_out, 1)
+    a_s = _rand_normal_matrix(rng, 1, d_in)
+    s_norm = _frobenius_norm_2d(_matmul_2d(b_s, a_s))
+    b_s = _scale_2d(b_s, 1.0 / s_norm)
     safety_dirs = [(b_s, a_s)]
 
     cfg = mods["BetaEditConfig"](
@@ -501,7 +620,6 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
     """Execute the full 5-part unbroken 4-layer vertical stack integration."""
     t_start = time.perf_counter()
     mods = _load_sibling_modules(env)
-    np = mods["np"]
 
     with tempfile.TemporaryDirectory(prefix="siliconcordat-vertical-") as td:
         root = Path(td)
@@ -687,9 +805,9 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
             "# UI\nBind text with textContent and never innerHTML.\n", encoding="utf-8"
         )
 
-        rng_base = np.random.default_rng(20261119)
-        w_old_mat = rng_base.standard_normal((16, 32)).astype(np.float32) * 0.2
-        ckpt_old_dir = _create_synthetic_checkpoint(root / "ckpt_old", w_old_mat, np, tag="W_old")
+        rng_base = random.Random(20261119)
+        w_old_mat = _rand_normal_matrix(rng_base, 16, 32, scale=0.2).to_f32()
+        ckpt_old_dir = _create_synthetic_checkpoint(root / "ckpt_old", w_old_mat, tag="W_old")
 
         adapters_dir = root / "adapters_old"
         adapters_dir.mkdir()
@@ -816,8 +934,8 @@ def run_vertical_stack_demo(env: SiblingEnvironment) -> dict[str, Any]:
             # STEP 5 (Cross-generation upgrade loop): W_old -> W_new
             # ------------------------------------------------------------------
             w_new_mat = w_old_mat.copy()
-            w_new_mat[0, 0] += 0.125
-            ckpt_new_dir = _create_synthetic_checkpoint(root / "ckpt_new", w_new_mat, np, tag="W_new")
+            w_new_mat[0][0] = _f32(w_new_mat[0][0] + 0.125)
+            ckpt_new_dir = _create_synthetic_checkpoint(root / "ckpt_new", w_new_mat, tag="W_new")
 
             # Recompile corpus adapter on W_new ONLY after verifying W_old is rejected on W_new
             adapters_new_dir = root / "adapters_new"
