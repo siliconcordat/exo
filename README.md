@@ -50,5 +50,6 @@ The optional live vertical stack tests (`tests/test_vertical_stack.py`, 2 tests)
 ## Documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): Trust firewall, core module contracts, interference matrix, and Hard Vetoes compliance.
+- [docs/contextual-compute.md](docs/contextual-compute.md): Proposed note on steering, the open parameter set, and a two-sided record.
 - [docs/VERTICAL-INTEGRATION.md](docs/VERTICAL-INTEGRATION.md): Four-layer live vertical integration commands, measured results, and cross-layer schema findings.
 - [LICENSE](LICENSE): Apache License 2.0 for code. Documentation is licensed under CC BY 4.0.
