@@ -6,14 +6,19 @@ Covers:
     100% HMAC-SHA256 verification.
   - Multiple independent AppendOnlyLedger instances targeting the same file concurrently.
   - Real 2-process concurrent append via subprocess (exercising POSIX fcntl.flock exclusion across processes).
-  - Write and os.fsync failure rollback via os.ftruncate(fd, committed_offset) + os.fsync(fd) before unlock,
+  - Write and os.fsync failure rollback via os.ftruncate(fd, write_offset) + os.fsync(fd) before unlock,
     preserving disk integrity and leaving in-memory _entries/_synced_size unchanged.
-  - Newline-framed torn-tail recovery (mid-object tear, missing trailing newline, and mid-line file shrink)
-    never wedging append() or gluing two JSON objects onto one line.
+  - Preservation & in-place newline repair of a complete, valid, HMAC-signed record missing only its
+    trailing '\n' (both multi-entry and single-entry seq=1), pinning strict_newline=True in verify_chain(),
+    failing closed on an invalid signature, and never silently erasing committed history.
+  - Auditable torn-tail recovery (mid-object tear, 4 KiB long tear pinning os.ftruncate, non-chaining
+    duplicate record missing '\n', and mid-line file shrink) recording a chained torn_tail_discarded
+    audit entry with discarded_sha256, discarded_bytes, and committed_offset.
   - Live second-instance reader resync on entries() and head_sha256 via fstat under RLock + LOCK_SH.
-  - Direct verification of os.fsync, parent-dir fsync on create, O_NOFOLLOW symlink rejection, and O_CLOEXEC.
+  - Direct verification of os.fsync, best-effort parent-dir fsync on create, final-component O_NOFOLLOW
+    symlink rejection (both at construction and post-construction TOCTOU), and O_CLOEXEC.
   - Spend-boundary fail-closed checks (NaN, Inf, -0.01, and max_auto_spend_usd + 1e-9).
-  - Zero bare asserts; runs cleanly across -I -B, -I -O -B, and -I -B -W error.
+  - Zero bare asserts in touched files; runs cleanly across -I -B, -I -O -B, and -I -B -W error.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ for p in (str(REPO_ROOT), str(SRC_ROOT)):
         sys.path.insert(0, p)
 
 from exo.gate import ActionEnvelope, ApprovalGate
-from exo.ledger import AppendOnlyLedger
+from exo.ledger import AppendOnlyLedger, sha256_hex
 
 
 class TestExoLedgerConcurrencyAndDurability(unittest.TestCase):
@@ -211,7 +216,77 @@ class TestExoLedgerConcurrencyAndDurability(unittest.TestCase):
             self.assertEqual(e2.prev_sha256, e1.entry_sha256)
             self.assertEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
 
-    def test_torn_tail_missing_newline_and_midline_shrink_recover_cleanly(self) -> None:
+    def test_valid_signed_record_missing_trailing_newline_is_repaired_not_erased(self) -> None:
+        key = b"exo-valid-no-nl-hmac-key-32bytes"
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) Multi-entry chain: strip ONLY the final '\n' from a valid HMAC-signed seq=3 entry
+            path = Path(tmp) / "strip_eol.jsonl"
+            ledger = AppendOnlyLedger(path)
+            e1 = ledger.append("approval", "human", {"i": 0}, signing_key=key)
+            e2 = ledger.append("approval", "human", {"i": 1}, signing_key=key)
+            e3 = ledger.append("human_stop_fence", "human", {"i": 2}, signing_key=key)
+
+            raw = path.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            path.write_bytes(raw[:-1])
+
+            restarted = AppendOnlyLedger(path)
+            # strict_newline=True in verify_chain() MUST still detect the missing trailing newline
+            errs = restarted.verify_chain(signing_key=key, require_signatures=True)
+            self.assertTrue(
+                any("unterminated trailing record" in err for err in errs),
+                msg=f"expected strict_newline failure, got {errs!r}",
+            )
+            # Readers MUST NOT silently hide e3
+            self.assertEqual(len(restarted.entries()), 3)
+            self.assertEqual(restarted.head_sha256, e3.entry_sha256)
+
+            # append() MUST repair e3 with '\n' and chain e4 onto e3 (NEVER erase e3)
+            e4 = restarted.append("after_eol_repair", "actor", {"i": 3}, signing_key=key)
+            self.assertEqual(e4.seq, 4)
+            self.assertEqual(e4.prev_sha256, e3.entry_sha256)
+            self.assertEqual(restarted.verify_chain(signing_key=key, require_signatures=True), [])
+            self.assertEqual(restarted.entries(event_type="torn_tail_discarded"), [])
+            self.assertEqual([e.entry_sha256 for e in restarted.entries()], [
+                e1.entry_sha256,
+                e2.entry_sha256,
+                e3.entry_sha256,
+                e4.entry_sha256,
+            ])
+            resolved_e3 = restarted.resolve_verified_entry(
+                e3.entry_sha256,
+                expected_event_type="human_stop_fence",
+                signing_key=key,
+                require_signatures=True,
+            )
+            self.assertEqual(resolved_e3.payload, {"i": 2})
+
+            # 2) Single-entry file (seq=1, no '\n' anywhere in file) also repairs cleanly
+            single_path = Path(tmp) / "single_no_nl.jsonl"
+            single_ledger = AppendOnlyLedger(single_path)
+            s1 = single_ledger.append("genesis_fence", "human", {"k": "v"}, signing_key=key)
+            single_path.write_bytes(single_path.read_bytes()[:-1])
+            single_reloaded = AppendOnlyLedger(single_path)
+            single_errs = single_reloaded.verify_chain(signing_key=key, require_signatures=True)
+            self.assertTrue(any("unterminated trailing record" in err for err in single_errs), msg=repr(single_errs))
+            self.assertEqual(len(single_reloaded.entries()), 1)
+            self.assertEqual(single_reloaded.head_sha256, s1.entry_sha256)
+            s2 = single_reloaded.append("second", "actor", {"k": "v2"}, signing_key=key)
+            self.assertEqual(s2.seq, 2)
+            self.assertEqual(s2.prev_sha256, s1.entry_sha256)
+            self.assertEqual(single_reloaded.verify_chain(signing_key=key, require_signatures=True), [])
+
+            # 3) Unterminated valid-hash record with WRONG HMAC signature MUST fail closed without erasing it
+            bad_sig_path = Path(tmp) / "bad_sig_no_nl.jsonl"
+            bad_sig_ledger = AppendOnlyLedger(bad_sig_path)
+            bad_sig_ledger.append("signed_with_other_key", "actor", {"x": 1}, signing_key=b"other-key-32-bytes-0000000000000")
+            before_bytes = bad_sig_path.read_bytes()[:-1]
+            bad_sig_path.write_bytes(before_bytes)
+            with self.assertRaises(ValueError):
+                AppendOnlyLedger(bad_sig_path).append("next", "actor", {"x": 2}, signing_key=key)
+            self.assertEqual(bad_sig_path.read_bytes(), before_bytes)
+
+    def test_torn_tail_long_tear_and_midline_shrink_recover_with_audit_entry(self) -> None:
         key = b"exo-torn-tail-hmac-key-32-bytes!"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "torn.jsonl"
@@ -220,42 +295,67 @@ class TestExoLedgerConcurrencyAndDurability(unittest.TestCase):
             size_after_e1 = path.stat().st_size
 
             # Case A: mid-object torn partial tail (simulating SIGKILL mid-write), including fresh instance restart
+            torn_a = b'{"seq":2,"event_type":"torn_unterminated'
             with path.open("ab") as fh:
-                fh.write(b'{"seq":2,"event_type":"torn_unterminated')
+                fh.write(torn_a)
             restarted = AppendOnlyLedger(path)
             self.assertNotEqual(restarted.verify_chain(signing_key=key, require_signatures=True), [])
             self.assertEqual(len(restarted.entries()), 1)
             self.assertEqual(restarted.head_sha256, e1.entry_sha256)
 
-            e2 = restarted.append("after_tear", "actor", {"i": 2}, signing_key=key)
-            self.assertEqual(e2.seq, 2)
-            self.assertEqual(e2.prev_sha256, e1.entry_sha256)
+            e_after_a = restarted.append("after_tear", "actor", {"i": 2}, signing_key=key)
+            # Recovery logs an auditable torn_tail_discarded entry (seq=2), then caller's entry (seq=3)
+            self.assertEqual(e_after_a.seq, 3)
+            entries_a = ledger.entries()
+            self.assertEqual(len(entries_a), 3)
+            self.assertEqual(entries_a[1].event_type, "torn_tail_discarded")
+            self.assertEqual(entries_a[1].prev_sha256, e1.entry_sha256)
+            self.assertEqual(entries_a[1].payload["discarded_bytes"], len(torn_a))
+            self.assertEqual(entries_a[1].payload["discarded_sha256"], sha256_hex(torn_a))
+            self.assertEqual(entries_a[1].payload["committed_offset"], size_after_e1)
+            self.assertEqual(e_after_a.prev_sha256, entries_a[1].entry_sha256)
             self.assertEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
-            self.assertEqual(len(ledger.entries()), 2)
 
-            # Case B: complete JSON object missing ONLY its trailing '\n' must NOT glue next line
-            valid_no_nl = path.read_bytes().splitlines()[1]
+            # Case B: long torn tail (4 KiB, much longer than replacement records) pins os.ftruncate()
+            offset_before_b = path.stat().st_size
+            long_torn = b'{"seq":4,"event_type":"long_crash","pad":"' + (b"X" * 4096)
             with path.open("ab") as fh:
-                fh.write(valid_no_nl)
+                fh.write(long_torn)
             self.assertNotEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
-            e3 = ledger.append("after_missing_nl", "actor", {"i": 3}, signing_key=key)
-            self.assertEqual(e3.seq, 3)
-            self.assertEqual(e3.prev_sha256, e2.entry_sha256)
+            e_after_b = ledger.append("after_long_tear", "actor", {"i": 3}, signing_key=key)
+            self.assertEqual(e_after_b.seq, 5)
+            self.assertEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
+            entries_b = ledger.entries()
+            self.assertEqual(len(entries_b), 5)
+            self.assertEqual(entries_b[3].event_type, "torn_tail_discarded")
+            self.assertEqual(entries_b[3].payload["discarded_bytes"], len(long_torn))
+            self.assertEqual(entries_b[3].payload["discarded_sha256"], sha256_hex(long_torn))
+            self.assertEqual(entries_b[3].payload["committed_offset"], offset_before_b)
+            self.assertLess(path.stat().st_size, offset_before_b + len(long_torn))
+
+            # Case C: non-chaining duplicate JSON object missing '\n' is discarded with audit trail (not glued)
+            dup_no_nl = path.read_bytes().splitlines()[2]
+            with path.open("ab") as fh:
+                fh.write(dup_no_nl)
+            self.assertNotEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
+            e_after_c = ledger.append("after_dup_tail", "actor", {"i": 4}, signing_key=key)
+            self.assertEqual(e_after_c.seq, 7)
             raw_lines = path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(raw_lines), 3)
+            self.assertEqual(len(raw_lines), 7)
             for idx, raw in enumerate(raw_lines, 1):
                 self.assertEqual(json.loads(raw)["seq"], idx)
             self.assertEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
 
-            # Case C: external shrink to mid-line inside entry 2 must NOT permanently wedge append
+            # Case D: external shrink to mid-line inside entry 2 recovers with audit entry and never wedges append
             with path.open("r+b") as fh:
                 fh.truncate(size_after_e1 + 20)
             self.assertEqual(len(ledger.entries()), 1)
             self.assertEqual(ledger.head_sha256, e1.entry_sha256)
-            e2_repaired = ledger.append("after_shrink", "actor", {"i": 200}, signing_key=key)
-            self.assertEqual(e2_repaired.seq, 2)
-            self.assertEqual(e2_repaired.prev_sha256, e1.entry_sha256)
-            self.assertEqual(len(ledger.entries()), 2)
+            e_repaired = ledger.append("after_shrink", "actor", {"i": 200}, signing_key=key)
+            self.assertEqual(e_repaired.seq, 3)
+            self.assertEqual(len(ledger.entries()), 3)
+            self.assertEqual(ledger.entries()[1].event_type, "torn_tail_discarded")
+            self.assertEqual(ledger.entries()[1].payload["discarded_bytes"], 20)
             self.assertEqual(ledger.verify_chain(signing_key=key, require_signatures=True), [])
 
     def test_two_process_concurrent_append_via_subprocess(self) -> None:
@@ -343,19 +443,25 @@ class TestExoLedgerConcurrencyAndDurability(unittest.TestCase):
                 ledger.append("durable_event", "agent", {"k": 1})
                 ledger.append("durable_event", "agent", {"k": 2})
 
-            # First append calls file fsync + parent-dir fsync on create; second calls file fsync.
+            # First append calls file fsync + best-effort parent-dir fsync on create; second calls file fsync.
             self.assertGreaterEqual(len(fsync_calls), 3)
             self.assertEqual(ledger.verify_chain(), [])
 
-            # Symlink target must fail closed via O_NOFOLLOW
+            # Final-component symlink target must fail closed via O_NOFOLLOW at construction time
             real_target = Path(tmp) / "real.jsonl"
             real_target.write_text("", encoding="utf-8")
             link_path = Path(tmp) / "link.jsonl"
             link_path.symlink_to(real_target)
-            sym_ledger = AppendOnlyLedger()
-            sym_ledger.path = link_path
+            with self.assertRaises(ValueError):
+                AppendOnlyLedger(link_path)
+
+            # And if a symlink is swapped into place after construction (TOCTOU before first append),
+            # append() must also fail closed via O_NOFOLLOW.
+            toctou_path = Path(tmp) / "toctou.jsonl"
+            toctou_ledger = AppendOnlyLedger(toctou_path)
+            toctou_path.symlink_to(real_target)
             with self.assertRaises(OSError):
-                sym_ledger.append("symlink_attack", "agent", {"x": 1})
+                toctou_ledger.append("symlink_attack", "agent", {"x": 1})
 
     def test_gate_spend_boundaries_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -384,7 +490,7 @@ class TestExoLedgerConcurrencyAndDurability(unittest.TestCase):
             self.assertNotEqual(verdict_over.decision, "allow")
             self.assertEqual(ledger.verify_chain(signing_key=b"gate-key-32-bytes-00000000000001", require_signatures=True), [])
 
-    def test_zero_bare_asserts_in_ledger_and_tests(self) -> None:
+    def test_zero_bare_asserts_in_touched_files(self) -> None:
         for rel in ("src/exo/ledger.py", "tests/test_ledger_concurrency.py"):
             tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
             self.assertEqual([n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assert)], [])

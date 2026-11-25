@@ -13,22 +13,38 @@ import re
 import stat
 import threading
 from typing import Any, Mapping, Optional
+import weakref
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
+except ImportError:  # pragma: no cover - non-POSIX fallback (in-process RLock only)
     fcntl = None  # type: ignore[assignment]
 
+
+class _PathLock:
+    """Weak-referenceable wrapper around threading.RLock for per-path serialization."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def __enter__(self) -> "_PathLock":
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._lock.release()
+
+
 _PATH_LOCKS_GUARD = threading.Lock()
-_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS: "weakref.WeakValueDictionary[str, _PathLock]" = weakref.WeakValueDictionary()
 
 
-def _path_lock_for(path: Path) -> threading.RLock:
+def _path_lock_for(path: Path) -> _PathLock:
     key = os.path.realpath(str(path))
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.get(key)
         if lock is None:
-            lock = threading.RLock()
+            lock = _PathLock()
             _PATH_LOCKS[key] = lock
         return lock
 
@@ -60,7 +76,7 @@ def _fsync_dir(dir_path: Path) -> None:
 
 
 def _open_ledger_rw(path: Path) -> tuple[int, bool]:
-    """Open or atomically create a regular ledger file with O_NOFOLLOW and O_CLOEXEC."""
+    """Open or atomically create a regular ledger file with final-component O_NOFOLLOW and O_CLOEXEC."""
     base_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     create_flags = base_flags | os.O_CREAT | os.O_EXCL
     for _ in range(4):
@@ -257,6 +273,8 @@ class AppendOnlyLedger:
         self._synced_size: int = 0
         self._synced_id: Optional[tuple[int, int]] = None
         self._synced_mtime_ns: Optional[int] = None
+        self._synced_ctime_ns: Optional[int] = None
+        self._synced_clean: bool = False
         if self.path is not None and self.path.exists():
             with _path_lock_for(self.path):
                 self._resync_from_disk_shared_locked(strict=False)
@@ -281,14 +299,51 @@ class AppendOnlyLedger:
             loaded.append(LedgerEntry.from_dict(obj))
         return loaded
 
-    def _parse_committed_prefix(self, raw_bytes: bytes) -> tuple[list[LedgerEntry], int, bool]:
-        """Parse only complete newline-terminated JSONL records from raw_bytes."""
+    def _try_parse_valid_chained_tail(
+        self,
+        tail_bytes: bytes,
+        prefix_entries: list[LedgerEntry],
+    ) -> Optional[LedgerEntry]:
+        """Return a LedgerEntry iff tail_bytes is a complete, hash-chained continuation record."""
+        if not tail_bytes or not tail_bytes.strip():
+            return None
+        try:
+            text = tail_bytes.decode("utf-8")
+            obj = json.loads(text)
+            if not isinstance(obj, dict):
+                return None
+            candidate = LedgerEntry.from_dict(obj)
+            recomputed = sha256_hex(canonical_json_bytes(candidate.body_dict()))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        expected_seq = len(prefix_entries) + 1
+        expected_prev = prefix_entries[-1].entry_sha256 if prefix_entries else GENESIS_HASH
+        if candidate.seq != expected_seq or candidate.prev_sha256 != expected_prev:
+            return None
+        if not hmac.compare_digest(recomputed, candidate.entry_sha256):
+            return None
+        return candidate
+
+    def _parse_committed_prefix(self, raw_bytes: bytes) -> tuple[list[LedgerEntry], int, str, bytes]:
+        """Parse committed records and classify any unterminated trailing bytes.
+
+        Returns (entries, write_offset, tail_kind, torn_tail_bytes) where tail_kind is:
+          - "clean": empty file or trailing newline present;
+          - "valid_no_nl": unterminated tail is a complete, hash-chained continuation entry
+            (included in entries so readers never drop it and append() repairs it with '\\n');
+          - "torn": unterminated tail is corrupt/partial/non-chaining and must be truncated
+            with an auditable torn_tail_discarded ledger record on the next append().
+        """
         last_nl = raw_bytes.rfind(b"\n")
         committed_len = last_nl + 1 if last_nl != -1 else 0
-        has_torn_tail = committed_len < len(raw_bytes)
-        if committed_len == 0:
-            return [], 0, has_torn_tail
-        return self._parse_jsonl_bytes(raw_bytes[:committed_len]), committed_len, has_torn_tail
+        prefix_entries = self._parse_jsonl_bytes(raw_bytes[:committed_len]) if committed_len > 0 else []
+        if committed_len == len(raw_bytes):
+            return prefix_entries, committed_len, "clean", b""
+        tail_bytes = raw_bytes[committed_len:]
+        valid_tail = self._try_parse_valid_chained_tail(tail_bytes, prefix_entries)
+        if valid_tail is not None:
+            return prefix_entries + [valid_tail], len(raw_bytes), "valid_no_nl", b""
+        return prefix_entries, committed_len, "torn", tail_bytes
 
     def _read_from_fd(self, fd: int, offset: int) -> bytes:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -300,52 +355,58 @@ class AppendOnlyLedger:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    def _resync_fd_locked(self, fd: int, st: os.stat_result) -> tuple[int, bool]:
-        """Resync cached entries from an already-flocked fd; returns (committed_offset, has_torn_tail)."""
+    def _resync_fd_locked(self, fd: int, st: os.stat_result) -> tuple[int, str, bytes]:
+        """Resync cached entries from an already-flocked fd; returns (write_offset, tail_kind, torn_tail_bytes)."""
         cur_size = st.st_size
         file_id = (st.st_dev, st.st_ino)
         mtime_ns = st.st_mtime_ns
+        ctime_ns = st.st_ctime_ns
 
-        # O(1) fast path when inode, size, and mtime match a clean synced snapshot.
+        # O(1) fast path when inode, size, mtime_ns, and ctime_ns match a clean synced snapshot.
         if (
-            self._synced_id == file_id
+            self._synced_clean
+            and self._synced_id == file_id
             and cur_size == self._synced_size
             and self._synced_mtime_ns == mtime_ns
+            and self._synced_ctime_ns == ctime_ns
         ):
-            return self._synced_size, False
+            return self._synced_size, "clean", b""
 
-        # Genuine tail-read fast path when same inode grew strictly past synced clean offset.
-        if self._synced_id == file_id and cur_size > self._synced_size:
+        # Genuine tail-read fast path when same inode grew cleanly past synced clean offset.
+        if self._synced_clean and self._synced_id == file_id and cur_size > self._synced_size:
             tail_bytes = self._read_from_fd(fd, self._synced_size)
-            try:
-                tail_entries, tail_committed, tail_torn = self._parse_committed_prefix(tail_bytes)
-            except ValueError:
-                tail_entries = []
-                tail_committed = -1
-                tail_torn = False
-            if tail_committed >= 0:
-                if not tail_entries:
-                    committed_offset = self._synced_size + tail_committed
-                    self._synced_size = committed_offset
-                    self._synced_mtime_ns = None if tail_torn else mtime_ns
-                    return committed_offset, tail_torn
-                expected_seq = len(self._entries) + 1
-                expected_prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
-                if tail_entries[0].seq == expected_seq and tail_entries[0].prev_sha256 == expected_prev:
-                    self._entries.extend(tail_entries)
-                    committed_offset = self._synced_size + tail_committed
-                    self._synced_size = committed_offset
-                    self._synced_mtime_ns = None if tail_torn else mtime_ns
-                    return committed_offset, tail_torn
+            if tail_bytes.endswith(b"\n"):
+                try:
+                    tail_entries = self._parse_jsonl_bytes(tail_bytes, strict_newline=True)
+                except ValueError:
+                    tail_entries = None
+                if tail_entries is not None:
+                    if not tail_entries:
+                        self._synced_size = cur_size
+                        self._synced_mtime_ns = mtime_ns
+                        self._synced_ctime_ns = ctime_ns
+                        self._synced_clean = True
+                        return cur_size, "clean", b""
+                    expected_seq = len(self._entries) + 1
+                    expected_prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+                    if tail_entries[0].seq == expected_seq and tail_entries[0].prev_sha256 == expected_prev:
+                        self._entries.extend(tail_entries)
+                        self._synced_size = cur_size
+                        self._synced_mtime_ns = mtime_ns
+                        self._synced_ctime_ns = ctime_ns
+                        self._synced_clean = True
+                        return cur_size, "clean", b""
 
-        # Full resync on first read, file shrink, inode change, rewrite, or non-contiguous delta.
+        # Full resync on first read, file shrink, inode change, rewrite, unterminated tail, or non-contiguous delta.
         raw_bytes = self._read_from_fd(fd, 0)
-        entries, committed_offset, has_torn_tail = self._parse_committed_prefix(raw_bytes)
+        entries, write_offset, tail_kind, torn_tail_bytes = self._parse_committed_prefix(raw_bytes)
         self._entries = entries
-        self._synced_size = committed_offset
+        self._synced_size = write_offset
         self._synced_id = file_id
-        self._synced_mtime_ns = None if has_torn_tail else mtime_ns
-        return committed_offset, has_torn_tail
+        self._synced_clean = tail_kind == "clean"
+        self._synced_mtime_ns = mtime_ns if self._synced_clean else None
+        self._synced_ctime_ns = ctime_ns if self._synced_clean else None
+        return write_offset, tail_kind, torn_tail_bytes
 
     def _resync_from_disk_shared_locked(self, *, strict: bool = False) -> None:
         """Resync cached entries from disk under LOCK_SH (caller holds _path_lock_for)."""
@@ -359,6 +420,8 @@ class AppendOnlyLedger:
                 self._synced_size = 0
                 self._synced_id = None
                 self._synced_mtime_ns = None
+                self._synced_ctime_ns = None
+                self._synced_clean = False
             return
         except OSError as exc:
             raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
@@ -376,6 +439,8 @@ class AppendOnlyLedger:
                     self._synced_size = len(raw_bytes)
                     self._synced_id = (st.st_dev, st.st_ino)
                     self._synced_mtime_ns = st.st_mtime_ns
+                    self._synced_ctime_ns = st.st_ctime_ns
+                    self._synced_clean = True
                 else:
                     self._resync_fd_locked(fd, st)
             finally:
@@ -477,7 +542,7 @@ class AppendOnlyLedger:
         signing_key: Optional[bytes] = None,
         timestamp_utc: Optional[str] = None,
     ) -> LedgerEntry:
-        """Append one content-addressed entry with locked, fsynced durability when file-backed."""
+        """Append one content-addressed entry with per-path RLock, POSIX fcntl.flock (when available), and fsync durability."""
         if not event_type or not isinstance(event_type, str):
             raise ValueError("event_type must be a non-empty string")
         if not actor_id or not isinstance(actor_id, str):
@@ -516,49 +581,105 @@ class AppendOnlyLedger:
                     prev_size = self._synced_size
                     prev_id = self._synced_id
                     prev_mtime = self._synced_mtime_ns
+                    prev_ctime = self._synced_ctime_ns
+                    prev_clean = self._synced_clean
 
                     st = os.fstat(fd)
-                    committed_offset, has_torn_tail = self._resync_fd_locked(fd, st)
-                    seq = len(self._entries) + 1
-                    prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+                    write_offset, tail_kind, torn_tail_bytes = self._resync_fd_locked(fd, st)
+
+                    # If the file ends with a valid hash-chained record missing only '\n',
+                    # verify its HMAC when signing_key is provided (fail closed on bad signature)
+                    # and repair it in place with '\n' instead of erasing committed history.
+                    if tail_kind == "valid_no_nl" and signing_key is not None:
+                        tail_entry = self._entries[-1]
+                        if tail_entry.signature_kind == "hmac-sha256":
+                            expected_sig = hmac_sha256_hex(
+                                signing_key,
+                                tail_entry.entry_sha256.encode("ascii"),
+                            )
+                            if not tail_entry.signature or not hmac.compare_digest(
+                                expected_sig,
+                                tail_entry.signature,
+                            ):
+                                self._entries = prev_entries
+                                self._synced_size = prev_size
+                                self._synced_id = prev_id
+                                self._synced_mtime_ns = prev_mtime
+                                self._synced_ctime_ns = prev_ctime
+                                self._synced_clean = prev_clean
+                                raise ValueError(
+                                    "unterminated trailing record has invalid hmac-sha256 signature"
+                                )
+
+                    new_entries: list[LedgerEntry] = []
+                    next_seq = len(self._entries) + 1
+                    next_prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+
+                    if tail_kind == "torn":
+                        discard_entry = self._build_entry(
+                            seq=next_seq,
+                            ts=ts,
+                            event_type="torn_tail_discarded",
+                            safe_actor="exo.ledger",
+                            safe_payload={
+                                "committed_offset": write_offset,
+                                "discarded_bytes": len(torn_tail_bytes),
+                                "discarded_sha256": sha256_hex(torn_tail_bytes),
+                            },
+                            prev=next_prev,
+                            signing_key=signing_key,
+                        )
+                        new_entries.append(discard_entry)
+                        next_seq = discard_entry.seq + 1
+                        next_prev = discard_entry.entry_sha256
+
                     entry = self._build_entry(
-                        seq=seq,
+                        seq=next_seq,
                         ts=ts,
                         event_type=event_type,
                         safe_actor=safe_actor,
                         safe_payload=safe_payload,
-                        prev=prev,
+                        prev=next_prev,
                         signing_key=signing_key,
                     )
-                    line_bytes = canonical_json_bytes(entry.to_dict()) + b"\n"
+                    new_entries.append(entry)
+
+                    prefix_nl = b"\n" if tail_kind == "valid_no_nl" else b""
+                    write_bytes = prefix_nl + b"".join(
+                        canonical_json_bytes(rec.to_dict()) + b"\n" for rec in new_entries
+                    )
                     moved_or_mutated = False
                     try:
-                        if has_torn_tail:
-                            os.ftruncate(fd, committed_offset)
+                        if tail_kind == "torn":
+                            os.ftruncate(fd, write_offset)
                             moved_or_mutated = True
-                        os.lseek(fd, committed_offset, os.SEEK_SET)
+                        os.lseek(fd, write_offset, os.SEEK_SET)
                         moved_or_mutated = True
-                        _write_all_fd(fd, line_bytes)
+                        _write_all_fd(fd, write_bytes)
                         os.fsync(fd)
                         if created:
                             _fsync_dir(self.path.parent)
                     except BaseException:
                         if moved_or_mutated:
                             try:
-                                os.ftruncate(fd, committed_offset)
+                                os.ftruncate(fd, write_offset)
                                 os.fsync(fd)
                             except OSError:
                                 pass
                         self._entries = prev_entries
                         self._synced_size = prev_size
                         self._synced_id = prev_id
-                        self._synced_mtime_ns = prev_mtime
+                        self._synced_mtime_ns = None
+                        self._synced_ctime_ns = None
+                        self._synced_clean = False
                         raise
                     post_st = os.fstat(fd)
-                    self._entries.append(entry)
-                    self._synced_size = committed_offset + len(line_bytes)
+                    self._entries.extend(new_entries)
+                    self._synced_size = write_offset + len(write_bytes)
                     self._synced_id = (post_st.st_dev, post_st.st_ino)
                     self._synced_mtime_ns = post_st.st_mtime_ns
+                    self._synced_ctime_ns = post_st.st_ctime_ns
+                    self._synced_clean = True
                     return entry
                 finally:
                     if fcntl is not None:
