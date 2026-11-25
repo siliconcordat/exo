@@ -7,9 +7,73 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
+import stat
+import threading
 from typing import Any, Mapping, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _path_lock_for(path: Path) -> threading.RLock:
+    key = os.path.realpath(str(path))
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+def _write_all_fd(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    written = 0
+    total = len(data)
+    while written < total:
+        n = os.write(fd, view[written:])
+        if n <= 0:
+            raise OSError("short zero-byte write while appending to ledger")
+        written += n
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort POSIX parent-directory fsync after creating a new ledger file."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(dir_path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _open_ledger_rw(path: Path) -> tuple[int, bool]:
+    """Open or atomically create a regular ledger file with O_NOFOLLOW and O_CLOEXEC."""
+    base_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    create_flags = base_flags | os.O_CREAT | os.O_EXCL
+    for _ in range(4):
+        try:
+            fd = os.open(path, create_flags, 0o600)
+            return fd, True
+        except FileExistsError:
+            try:
+                fd = os.open(path, base_flags)
+                return fd, False
+            except FileNotFoundError:
+                continue
+    return os.open(path, base_flags | os.O_CREAT, 0o600), False
 
 GENESIS_HASH = "0" * 64
 REDACTED_PLACEHOLDER = "[REDACTED]"
@@ -188,18 +252,23 @@ class AppendOnlyLedger:
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else None
+        self._mem_lock = threading.RLock()
         self._entries: list[LedgerEntry] = []
+        self._synced_size: int = 0
+        self._synced_id: Optional[tuple[int, int]] = None
+        self._synced_mtime_ns: Optional[int] = None
         if self.path is not None and self.path.exists():
-            self._entries = self._load_from_disk()
+            with _path_lock_for(self.path):
+                self._resync_from_disk_shared_locked(strict=False)
 
-    def _load_from_disk(self) -> list[LedgerEntry]:
-        if self.path is None:
-            raise RuntimeError("cannot load ledger from disk when path is None")
-        loaded: list[LedgerEntry] = []
+    def _parse_jsonl_bytes(self, raw_bytes: bytes, *, strict_newline: bool = False) -> list[LedgerEntry]:
+        if strict_newline and raw_bytes and not raw_bytes.endswith(b"\n"):
+            raise ValueError(f"unterminated trailing record at end of ledger file {self.path}")
         try:
-            raw_text = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
+            raw_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"cannot decode ledger file {self.path}: {exc}") from exc
+        loaded: list[LedgerEntry] = []
         for line_no, line in enumerate(raw_text.splitlines(), 1):
             if not line.strip():
                 continue
@@ -212,31 +281,165 @@ class AppendOnlyLedger:
             loaded.append(LedgerEntry.from_dict(obj))
         return loaded
 
+    def _parse_committed_prefix(self, raw_bytes: bytes) -> tuple[list[LedgerEntry], int, bool]:
+        """Parse only complete newline-terminated JSONL records from raw_bytes."""
+        last_nl = raw_bytes.rfind(b"\n")
+        committed_len = last_nl + 1 if last_nl != -1 else 0
+        has_torn_tail = committed_len < len(raw_bytes)
+        if committed_len == 0:
+            return [], 0, has_torn_tail
+        return self._parse_jsonl_bytes(raw_bytes[:committed_len]), committed_len, has_torn_tail
+
+    def _read_from_fd(self, fd: int, offset: int) -> bytes:
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _resync_fd_locked(self, fd: int, st: os.stat_result) -> tuple[int, bool]:
+        """Resync cached entries from an already-flocked fd; returns (committed_offset, has_torn_tail)."""
+        cur_size = st.st_size
+        file_id = (st.st_dev, st.st_ino)
+        mtime_ns = st.st_mtime_ns
+
+        # O(1) fast path when inode, size, and mtime match a clean synced snapshot.
+        if (
+            self._synced_id == file_id
+            and cur_size == self._synced_size
+            and self._synced_mtime_ns == mtime_ns
+        ):
+            return self._synced_size, False
+
+        # Genuine tail-read fast path when same inode grew strictly past synced clean offset.
+        if self._synced_id == file_id and cur_size > self._synced_size:
+            tail_bytes = self._read_from_fd(fd, self._synced_size)
+            try:
+                tail_entries, tail_committed, tail_torn = self._parse_committed_prefix(tail_bytes)
+            except ValueError:
+                tail_entries = []
+                tail_committed = -1
+                tail_torn = False
+            if tail_committed >= 0:
+                if not tail_entries:
+                    committed_offset = self._synced_size + tail_committed
+                    self._synced_size = committed_offset
+                    self._synced_mtime_ns = None if tail_torn else mtime_ns
+                    return committed_offset, tail_torn
+                expected_seq = len(self._entries) + 1
+                expected_prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+                if tail_entries[0].seq == expected_seq and tail_entries[0].prev_sha256 == expected_prev:
+                    self._entries.extend(tail_entries)
+                    committed_offset = self._synced_size + tail_committed
+                    self._synced_size = committed_offset
+                    self._synced_mtime_ns = None if tail_torn else mtime_ns
+                    return committed_offset, tail_torn
+
+        # Full resync on first read, file shrink, inode change, rewrite, or non-contiguous delta.
+        raw_bytes = self._read_from_fd(fd, 0)
+        entries, committed_offset, has_torn_tail = self._parse_committed_prefix(raw_bytes)
+        self._entries = entries
+        self._synced_size = committed_offset
+        self._synced_id = file_id
+        self._synced_mtime_ns = None if has_torn_tail else mtime_ns
+        return committed_offset, has_torn_tail
+
+    def _resync_from_disk_shared_locked(self, *, strict: bool = False) -> None:
+        """Resync cached entries from disk under LOCK_SH (caller holds _path_lock_for)."""
+        if self.path is None:
+            return
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(self.path, flags)
+        except FileNotFoundError:
+            if not self._entries:
+                self._synced_size = 0
+                self._synced_id = None
+                self._synced_mtime_ns = None
+            return
+        except OSError as exc:
+            raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"ledger path must be a regular file: {self.path}")
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            try:
+                st = os.fstat(fd)
+                if strict:
+                    raw_bytes = self._read_from_fd(fd, 0)
+                    self._entries = self._parse_jsonl_bytes(raw_bytes, strict_newline=True)
+                    self._synced_size = len(raw_bytes)
+                    self._synced_id = (st.st_dev, st.st_ino)
+                    self._synced_mtime_ns = st.st_mtime_ns
+                else:
+                    self._resync_fd_locked(fd, st)
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
+        finally:
+            os.close(fd)
+
+    def _load_from_disk_with_size(self, *, strict_newline: bool = True) -> tuple[list[LedgerEntry], int]:
+        if self.path is None:
+            raise RuntimeError("cannot load ledger from disk when path is None")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        with _path_lock_for(self.path):
+            try:
+                fd = os.open(self.path, flags)
+            except OSError as exc:
+                raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f"ledger path must be a regular file: {self.path}")
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_SH)
+                try:
+                    raw_bytes = self._read_from_fd(fd, 0)
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError as exc:
+                raise ValueError(f"cannot read ledger file {self.path}: {exc}") from exc
+            finally:
+                os.close(fd)
+        return self._parse_jsonl_bytes(raw_bytes, strict_newline=strict_newline), len(raw_bytes)
+
+    def _load_from_disk(self) -> list[LedgerEntry]:
+        loaded, _ = self._load_from_disk_with_size(strict_newline=True)
+        return loaded
+
     @property
     def head_sha256(self) -> str:
-        if not self._entries:
-            return GENESIS_HASH
-        return self._entries[-1].entry_sha256
+        if self.path is None:
+            with self._mem_lock:
+                if not self._entries:
+                    return GENESIS_HASH
+                return self._entries[-1].entry_sha256
+        with _path_lock_for(self.path):
+            self._resync_from_disk_shared_locked(strict=False)
+            if not self._entries:
+                return GENESIS_HASH
+            return self._entries[-1].entry_sha256
 
-    def append(
+    def _build_entry(
         self,
-        event_type: str,
-        actor_id: str,
-        payload: Mapping[str, Any],
         *,
-        signing_key: Optional[bytes] = None,
-        timestamp_utc: Optional[str] = None,
+        seq: int,
+        ts: str,
+        event_type: str,
+        safe_actor: str,
+        safe_payload: dict[str, Any],
+        prev: str,
+        signing_key: Optional[bytes],
     ) -> LedgerEntry:
-        """Append one content-addressed entry and persist it if file-backed."""
-        if not event_type or not isinstance(event_type, str):
-            raise ValueError("event_type must be a non-empty string")
-        if not actor_id or not isinstance(actor_id, str):
-            raise ValueError("actor_id must be a non-empty string")
-        seq = len(self._entries) + 1
-        ts = timestamp_utc or utc_now_iso()
-        prev = self.head_sha256
-        safe_actor = redact_secrets_in_text(actor_id)
-        safe_payload = redact_secrets_in_value(dict(payload))
         body = {
             "seq": seq,
             "timestamp_utc": ts,
@@ -253,7 +456,7 @@ class AppendOnlyLedger:
         else:
             sig_kind = "unsigned"
             sig_val = None
-        entry = LedgerEntry(
+        return LedgerEntry(
             seq=seq,
             timestamp_utc=ts,
             event_type=event_type,
@@ -264,19 +467,117 @@ class AppendOnlyLedger:
             signature_kind=sig_kind,
             signature=sig_val,
         )
-        if self.path is not None:
+
+    def append(
+        self,
+        event_type: str,
+        actor_id: str,
+        payload: Mapping[str, Any],
+        *,
+        signing_key: Optional[bytes] = None,
+        timestamp_utc: Optional[str] = None,
+    ) -> LedgerEntry:
+        """Append one content-addressed entry with locked, fsynced durability when file-backed."""
+        if not event_type or not isinstance(event_type, str):
+            raise ValueError("event_type must be a non-empty string")
+        if not actor_id or not isinstance(actor_id, str):
+            raise ValueError("actor_id must be a non-empty string")
+        ts = timestamp_utc or utc_now_iso()
+        safe_actor = redact_secrets_in_text(actor_id)
+        safe_payload = redact_secrets_in_value(dict(payload))
+
+        if self.path is None:
+            with self._mem_lock:
+                seq = len(self._entries) + 1
+                prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+                entry = self._build_entry(
+                    seq=seq,
+                    ts=ts,
+                    event_type=event_type,
+                    safe_actor=safe_actor,
+                    safe_payload=safe_payload,
+                    prev=prev,
+                    signing_key=signing_key,
+                )
+                self._entries.append(entry)
+                return entry
+
+        with _path_lock_for(self.path):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            line = canonical_json_bytes(entry.to_dict()).decode("ascii") + "\n"
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-        self._entries.append(entry)
-        return entry
+            fd, created = _open_ledger_rw(self.path)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f"ledger path must be a regular file: {self.path}")
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    prev_entries = list(self._entries)
+                    prev_size = self._synced_size
+                    prev_id = self._synced_id
+                    prev_mtime = self._synced_mtime_ns
+
+                    st = os.fstat(fd)
+                    committed_offset, has_torn_tail = self._resync_fd_locked(fd, st)
+                    seq = len(self._entries) + 1
+                    prev = self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+                    entry = self._build_entry(
+                        seq=seq,
+                        ts=ts,
+                        event_type=event_type,
+                        safe_actor=safe_actor,
+                        safe_payload=safe_payload,
+                        prev=prev,
+                        signing_key=signing_key,
+                    )
+                    line_bytes = canonical_json_bytes(entry.to_dict()) + b"\n"
+                    moved_or_mutated = False
+                    try:
+                        if has_torn_tail:
+                            os.ftruncate(fd, committed_offset)
+                            moved_or_mutated = True
+                        os.lseek(fd, committed_offset, os.SEEK_SET)
+                        moved_or_mutated = True
+                        _write_all_fd(fd, line_bytes)
+                        os.fsync(fd)
+                        if created:
+                            _fsync_dir(self.path.parent)
+                    except BaseException:
+                        if moved_or_mutated:
+                            try:
+                                os.ftruncate(fd, committed_offset)
+                                os.fsync(fd)
+                            except OSError:
+                                pass
+                        self._entries = prev_entries
+                        self._synced_size = prev_size
+                        self._synced_id = prev_id
+                        self._synced_mtime_ns = prev_mtime
+                        raise
+                    post_st = os.fstat(fd)
+                    self._entries.append(entry)
+                    self._synced_size = committed_offset + len(line_bytes)
+                    self._synced_id = (post_st.st_dev, post_st.st_ino)
+                    self._synced_mtime_ns = post_st.st_mtime_ns
+                    return entry
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def entries(self, event_type: Optional[str] = None) -> list[LedgerEntry]:
-        """Return all entries, optionally filtered by event_type."""
-        if event_type is None:
-            return list(self._entries)
-        return [e for e in self._entries if e.event_type == event_type]
+        """Return all committed entries, resyncing from disk when file-backed."""
+        if self.path is None:
+            with self._mem_lock:
+                if event_type is None:
+                    return list(self._entries)
+                return [e for e in self._entries if e.event_type == event_type]
+        with _path_lock_for(self.path):
+            self._resync_from_disk_shared_locked(strict=False)
+            if event_type is None:
+                return list(self._entries)
+            return [e for e in self._entries if e.event_type == event_type]
 
     def verify_chain(
         self,
